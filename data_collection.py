@@ -5,6 +5,9 @@ This program is designed to collect and record the live data from electrospray
 test set-up. This is also designed to allow the inputting of the desired 
 control voltage.
 
+You will need to have the ThorCam software installed for this to work for
+the camera connectivity.
+
 Created on Thu Feb 12 14:53:11 2026
 
 @author: euandh
@@ -25,7 +28,9 @@ from nidaqmx import constants
 import windows_setup   # This is Thorlabs windows set-up code    
 
 
-# NATIONAL INSTRUMENTS INITALISATION
+"""
+------------------- NATIONAL INSTRUMENTS INITALISATION -------------------
+"""
 
 # Module initialisation for NI
 sample_rate = 1         # Samples per channel per second (Hz)
@@ -49,8 +54,9 @@ for i in ai_channels_to_use:
 for i in ao_channels_to_use:
     ao_task.ao_channels.add_ao_voltage_chan(ao_channel_name+f"/ao{i}", min_val= ao_lims[0], max_val = ao_lims[1])
 
-
-# THORLABS INITIALISATION
+"""
+------------------- THORLABS INITALISATION -------------------
+"""
 DLL_dr = "C:\Program Files\Thorlabs\Scientific Imaging\ThorCam"
 
 try:
@@ -61,6 +67,10 @@ except ImportError:
     configure_path = None
 
 
+
+"""
+------------------- DATA LOGGING -------------------
+"""
 
 # Start data collection for inputs
 ai_task.timing.cfg_samp_clk_timing(sample_rate, sample_mode=AcquisitionType.CONTINUOUS)       # Could use the source input (for the sample clock) to ensure the sample rate clock is using the sample rate clock from my laptop rather than from the device (the DAQ chassis I presume?)
