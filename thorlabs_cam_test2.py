@@ -7,7 +7,6 @@ Created on Fri Feb 13 13:05:07 2026
 
 import os
 import tifffile
-import windows_setup
 from thorlabs_tsi_sdk.tl_camera import TLCameraSDK
 from thorlabs_tsi_sdk.tl_mono_to_color_processor import MonoToColorProcessorSDK
 from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
