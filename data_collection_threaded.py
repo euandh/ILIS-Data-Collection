@@ -33,6 +33,10 @@ Created on Thu Feb 12 14:53:11 2026
 import numpy as np
 import time
 import sys
+import csv
+import datetime
+
+# GUI Libaries
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QComboBox, QLineEdit,
                              QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog,
@@ -110,10 +114,10 @@ class CameraWorker(QThread):
         self.is_running = False
         self.wait() # Wait for the thread to finish safely
 
-
 # --- WORKER THREAD 2: NI DAQ CONTROL ---
 class DAQWorker(QThread):
     data_ready = pyqtSignal(float, float) # Sends (Voltage, Current)
+    log_message = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
@@ -121,12 +125,20 @@ class DAQWorker(QThread):
         
         # Initialise set-up variables
         self.filepath = "data.csv"
-        self.sample_rate = 4e-3 #time between samples in seconds
+        self.sample_rate = 4e-3 
         
-        # Initialise control variables and set default values.
+        # Initialise control variables
         self.target_voltage = 0.0
         self.polarity_mode = 0
-        self.high_time = 1 #dwell time in seconds
+        self.high_time = 1 
+        
+        # Initialise modules
+        self.ai_channel_name = "cDAQ9185-2023AF4Mod1"
+        self.ao_channel_name = "cDAQ9185-2023AF4Mod2"
+        self.ai_channels_to_use = [0, 1]
+        self.ao_channels_to_use = [0, 1]
+        self.ai_lims = [-10, 10]
+        self.ao_lims = [-10, 10]
 
     def set_voltage(self, val):
         self.target_voltage = val
@@ -140,23 +152,68 @@ class DAQWorker(QThread):
     def run(self):
         self.is_running = True
         
-        # --- [INSERT YOUR NI SETUP CODE HERE] ---
-        # ai_task = nidaqmx.Task() ...
-        
-        while self.is_running:
-            # --- [INSERT YOUR NI READ/WRITE CODE HERE] ---
-            # ai_task.read() ...
-            # ao_task.write(self.target_voltage) ...
+        # Create NI Tasks
+        self.ai_task = nidaqmx.Task()
+        self.ao_task = nidaqmx.Task()
+
+        try:
+            # Setup Channels
+            for i in self.ai_channels_to_use:
+                self.ai_task.ai_channels.add_ai_voltage_chan(
+                    f"{self.ai_channel_name}/ai{i}", 
+                    min_val=self.ai_lims[0], max_val=self.ai_lims[1]
+                )
+            self.log_message.emit(f"AI channels {self.ai_channels_to_use} added.")
+
+            for i in self.ao_channels_to_use:
+                self.ao_task.ao_channels.add_ao_voltage_chan(
+                    f"{self.ao_channel_name}/ao{i}", 
+                    min_val=self.ao_lims[0], max_val=self.ao_lims[1]
+                )
+            self.log_message.emit(f"AO channels {self.ao_channels_to_use} added.")
             
-            # SIMULATION (Delete this later)
-            time.sleep(self.sample_rate) # 20 Hz read rate
-            read_volts = self.target_voltage
-            read_current = read_volts / 1000 # Placeholder current
+            # Create File Header
+            with open(self.filepath, mode='w', newline='') as f:
+                csv.writer(f).writerow(["Timestamp", "Requested Voltage", "Applied Voltage", "Collected Current"])
             
-            self.data_ready.emit(read_volts, read_current)
+            # Main Loop
+            with open(self.filepath, mode='a', newline='') as f:
+                writer = csv.writer(f)
+                
+                while self.is_running:
+                    # --- Read/Write Logic ---
+                    # Need to add actual .read() and .write() calls here eventually
+                    read_volts = self.target_voltage
+                    read_current = read_volts / 1000 
+                    
+                    # Write to open file
+                    writer.writerow([datetime.datetime.now(), self.target_voltage, read_volts, read_current])
+                    
+                    time.sleep(self.sample_rate)
+                    self.data_ready.emit(read_volts, read_current)
+
+        except Exception as e:
+            self.log_message.emit(f"DAQ Error: {e}")
+
+        finally:
+            # CLEANUP
+            self.log_message.emit("Stopping DAQ tasks...")
             
-        # --- [INSERT YOUR NI TEAR DOWN CODE HERE] ---
-        # ai_task.stop() ...
+            # Close AI
+            try:
+                self.ai_task.stop()
+                self.ai_task.close() 
+            except:
+                pass
+                
+            # Close AO
+            try:
+                self.ao_task.stop()
+                self.ao_task.close() 
+            except:
+                pass
+                
+            self.log_message.emit("DAQ resources released.")
 
     def stop(self):
         self.is_running = False
@@ -329,6 +386,7 @@ class ElectrosprayUI(QMainWindow):
         self.cam_worker.log_message.connect(self.append_log)
         self.cam_worker.image_ready.connect(self.update_image_display) # You need to write this function
         self.daq_worker.data_ready.connect(self.update_daq_display)
+        self.daq_worker.log_message.connect(self.append_log)
 
     def start_system(self):
         # UI Updates
