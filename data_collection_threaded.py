@@ -36,8 +36,8 @@ import sys
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QComboBox, QLineEdit,
                              QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog,
-                             QGroupBox)
-from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
+                             QGroupBox, QGridLayout)
+from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt
 
 # National Instruments Libraries
 import nidaqmx
@@ -169,14 +169,18 @@ class ElectrosprayUI(QMainWindow):
         self.setWindowTitle("Electrospray Control and Data Acquisition")
         self.resize(1200, 800)
 
-        # 1. Setup UI Elements
+        # Start set-up of layout
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.layout = QVBoxLayout(self.central_widget)
+        self.main_layout = QVBoxLayout(self.centralWidget())
 
-        # Control Panel
-        controls_layout = QHBoxLayout()
+        # Row 1: Control box
+        self.top_controls_group = QGroupBox("Global Controls")
+        self.top_controls_group.setFixedHeight(80)
+        self.controls_layout = QHBoxLayout()
+        self.top_controls_group.setLayout(self.controls_layout)
         
+            # Boxes
         self.btn_start = QPushButton("Start Acquisition")
         self.btn_start.clicked.connect(self.start_system)
         
@@ -188,95 +192,134 @@ class ElectrosprayUI(QMainWindow):
         self.combo_mode.addItems(["Current Collection Only",\
                                   "Camera and Current Collection"])
 
-        controls_layout.addWidget(self.btn_start)
-        controls_layout.addWidget(self.btn_stop)
-        controls_layout.addWidget(self.combo_mode)
-        self.layout.addLayout(controls_layout)
+        self.controls_layout.addWidget(self.btn_start)
+        self.controls_layout.addWidget(self.btn_stop)
+        self.controls_layout.addWidget(self.combo_mode)
+        self.controls_layout.addStretch()        # Push everything left
         
-            # Set-up (static) variables
+        self.main_layout.addWidget(self.top_controls_group)
+        
+        
+        # Row 2: Settings (Static Settings | Live Control)
+        self.settings_layout = QHBoxLayout()
+        
+            # LEFT: Static Settings
+        self.group_static_settings = QGroupBox("Data Collection Settings")
+        self.static_set_layout = QGridLayout()
+        self.group_static_settings.setLayout(self.static_set_layout)
+        
                 # FPS
         self.input_fps = QDoubleSpinBox()
-        self.input_fps_label = QLabel("Camera FPS:")
-        self.input_fps_label.setBuddy(self.input_fps)
-        self.layout.addWidget(self.input_fps_label)
         self.input_fps.setValue(10)
         self.input_fps.setRange(0, 914.4)
-        self.layout.addWidget(self.input_fps)
         self.input_fps.setSuffix(" FPS")
-        self.input_fps.setSingleStep(1)
                 # ROI
-        self.input_ROI_width, self.input_ROI_height  = QSpinBox(), QSpinBox()
-        self.input_ROI_label = QLabel("Camera ROI :")
-        self.input_ROI_label.setBuddy(self.input_ROI_width)
-        self.layout.addWidget(self.input_ROI_label)
-        self.input_ROI_width.setMaximum(4096)
+        self.input_ROI_width = QSpinBox()
+        self.input_ROI_width.setMaximum(4096)        
+        self.input_ROI_width.setValue(4096)        
+        self.input_ROI_width.setSuffix(" px")  
+        self.input_ROI_height = QSpinBox()
         self.input_ROI_height.setMaximum(3000)
-        self.input_ROI_width.setValue(4096)
         self.input_ROI_height.setValue(3000)
-        self.input_ROI_width.setSuffix(" px")
         self.input_ROI_height.setSuffix(" px")
-        self.layout.addWidget(self.input_ROI_width)
-        self.layout.addWidget(self.input_ROI_height)
                 # Filepath
         self.input_filepath = QLineEdit()
-        self.input_filepath_label = QLabel("Filepath:")
-        self.input_filepath_label.setBuddy(self.input_filepath)
         self.input_filepath.setPlaceholderText("Enter filepath to folder for data logging here...")
-        self.input_filepath.setFixedHeight(30)
-        self.layout.addWidget(self.input_filepath_label)
-        self.layout.addWidget(self.input_filepath)
-                # Create a filename linked to the booting time
-        self.filenametime = time.strftime("ESPRAY_%Y-%m-%d_%H%M")
                 # Sample rate
         self.input_sample_rate = QDoubleSpinBox()
-        self.input_sample_rate_label = QLabel("Sample time:")
-        self.input_sample_rate_label.setBuddy(self.input_sample_rate)
-        self.layout.addWidget(self.input_sample_rate_label)
         self.input_sample_rate.setValue(40)
         self.input_sample_rate.setSuffix(" ms")
         self.input_sample_rate.setMinimum(0)
         self.input_sample_rate.setSingleStep(10)
-        self.layout.addWidget(self.input_sample_rate)
+
+                # Add all widgets
+        self.static_set_layout.addWidget(QLabel("Frame rate:"), 0, 0)
+        self.static_set_layout.addWidget(self.input_fps, 0, 1, 1, 4)
         
-        # Rolling inputs
-            # Voltage Control Spinner
-        self.voltage_spinner = QDoubleSpinBox()
-        self.voltage_spinner_label = QLabel("Emitter voltage:")
-        self.voltage_spinner_label.setBuddy(self.voltage_spinner)
-        self.layout.addWidget(self.voltage_spinner_label)
-        self.voltage_spinner.setSuffix(" V")
-        self.voltage_spinner.setRange(-5000, 5000)
-        self.voltage_spinner.setSingleStep(10)
-        self.voltage_spinner.valueChanged.connect(self.update_DAQ_voltage)
-        self.layout.addWidget(self.voltage_spinner)
-            # High time
+        self.static_set_layout.addWidget(QLabel("Region of interest:"), 1, 0)
+        self.static_set_layout.addWidget(QLabel("Width:"), 1, 1, alignment=Qt.AlignmentFlag.AlignRight)
+        self.static_set_layout.addWidget(self.input_ROI_width, 1, 2)
+        self.static_set_layout.addWidget(QLabel("Height:"), 1, 3, alignment=Qt.AlignmentFlag.AlignRight)
+        self.static_set_layout.addWidget(self.input_ROI_height, 1, 4, )
+        
+        self.static_set_layout.addWidget(QLabel("Save directory:"), 2, 0)
+        self.static_set_layout.addWidget(self.input_filepath, 2, 1, 1, 4)
+        
+        self.static_set_layout.addWidget(QLabel("Sample rate:"), 3, 0)
+        self.static_set_layout.addWidget(self.input_sample_rate, 3, 1, 1, 4)
+
+            # RIGHT: Rolling/live inputs
+        self.group_live_settings = QGroupBox("Live Settings")
+        self.live_set_layout = QGridLayout()
+        self.group_live_settings.setLayout(self.live_set_layout)
+        
+                # Voltage Control Spinner
+        self.input_voltage = QDoubleSpinBox()
+        self.input_voltage.setSuffix(" V")
+        self.input_voltage.setRange(-5000, 5000)
+        self.input_voltage.setSingleStep(10)
+        self.input_voltage.valueChanged.connect(self.update_DAQ_voltage)
+                # High time
         self.input_high_time = QDoubleSpinBox()
-        self.input_high_time_label = QLabel("Voltage high time:")
-        self.input_high_time_label.setBuddy(self.input_high_time)
-        self.layout.addWidget(self.input_high_time_label)
         self.input_high_time.setSuffix(" s")
         self.input_high_time.setMinimum(0)
         self.input_high_time.valueChanged.connect(self.update_DAQ_hightime)
-        self.layout.addWidget(self.input_high_time)
-            # Polarity mode
+                # Polarity mode
         self.input_polarity_mode = QComboBox()
-        self.input_polarity_mode_label = QLabel("Polarity mode:")
-        self.input_polarity_mode_label.setBuddy(self.input_polarity_mode)
-        self.layout.addWidget(self.input_polarity_mode_label)
         self.input_polarity_mode.addItems(["Bipolar switching", "Unipolar switching", "Unipolar constant"])
-        self.layout.addWidget(self.input_polarity_mode)
         self.input_polarity_mode.currentIndexChanged.connect(self.update_DAQ_polarity_mode)
 
-        # Dashboard (Voltage Display)
-        self.lbl_status = QLabel("System Ready")
-        self.lbl_voltage = QLabel("Voltage: 0.00 V")
-        self.layout.addWidget(self.lbl_status)
-        self.layout.addWidget(self.lbl_voltage)
+                # Add all widgets
+        self.live_set_layout.addWidget(QLabel("Emitter voltage: "), 0, 0)
+        self.live_set_layout.addWidget(self.input_voltage, 0, 1)
+        
+        self.live_set_layout.addWidget(QLabel("High time:"), 1, 0)
+        self.live_set_layout.addWidget(self.input_high_time, 1, 1)
+        
+        self.live_set_layout.addWidget(QLabel("Polarity mode:"), 2, 0)
+        self.live_set_layout.addWidget(self.input_polarity_mode, 2, 1)
+        
+            # MAKE WHOLE ROW: Add both groups to the layout
+        self.settings_layout.addWidget(self.group_static_settings)
+        self.settings_layout.addWidget(self.group_live_settings)
+        
+        self.main_layout.addLayout(self.settings_layout)
 
-        # Log Window
+        # Row 3: Live feeds (Camera Feed | Plot Feed)
+        self.feeds_layout = QHBoxLayout()
+        
+            # LEFT: Camera Feed (placeholder)
+        self.group_cam_feed = QGroupBox("Camera Feed")
+        self.group_cam_feed.setStyleSheet("background-color: black;") # placeholder black background
+        self.cam_feed_layout = QVBoxLayout()
+        self.group_cam_feed.setLayout(self.cam_feed_layout)
+        
+                # Placeholder label
+        self.camera_placeholder_text = QLabel("Waiting for camera...")
+        self.camera_placeholder_text.setStyleSheet("color: white; font-size:20px;")
+        self.cam_feed_layout.addWidget(self.camera_placeholder_text)
+
+
+            # RIGHT: Plot feed (placeholder)
+        self.group_plots = QGroupBox("Voltage and Current Plots")
+        self.plots_layout = QVBoxLayout()
+        self.group_plots.setLayout(self.plots_layout)
+        
+                # Placeholder label
+        self.voltage_placeholder_text = QLabel("0.00 V")
+        self.voltage_placeholder_text.setStyleSheet("font-size: 20px;")
+        self.plots_layout.addWidget(self.voltage_placeholder_text)
+            
+                # Log Window
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
-        self.layout.addWidget(self.log_box)
+        self.log_box.setMaximumHeight(100)
+        self.plots_layout.addWidget(self.log_box)
+        
+            # BUILD WHOLE ROW
+        self.feeds_layout.addWidget(self.group_cam_feed, stretch = 1)
+        self.feeds_layout.addWidget(self.group_plots, stretch = 1)
+        self.main_layout.addLayout(self.feeds_layout, stretch = 2)
 
         # 2. Initialize Workers
         self.cam_worker = CameraWorker()
@@ -294,10 +337,13 @@ class ElectrosprayUI(QMainWindow):
         self.combo_mode.setEnabled(False)
         self.append_log("System Starting...")
         
+        # Create timestamp linked filename
+        self.filenametime = time.strftime("ESPRAY_%Y-%m-%d_%H%M")
+        
         # Lock inputs
         self.input_fps.setEnabled(False)
         self.input_filepath.setEnabled(False)
-        self.input_polarity_mode.setEnabled(False)
+        self.input_sample_rate.setEnabled(False)
         
         # Check if camera is in use
         if "Camera" in self.combo_mode.currentText():
@@ -309,7 +355,6 @@ class ElectrosprayUI(QMainWindow):
         # Pass settings to workers
             # Cam worker
         if use_cam == True:
-            self.cam_worker.trigger_mode = self.combo_mode.currentText()
             self.cam_worker.filepath = f"{self.input_filepath.text()}/{self.filenametime}_IMAGES.tiff"
             self.cam_worker.ROI = [self.input_ROI_width.value(), self.input_ROI_height.value()]
             # Daq worker
@@ -340,7 +385,7 @@ class ElectrosprayUI(QMainWindow):
         # unlock inputs
         self.input_fps.setEnabled(True)
         self.input_filepath.setEnabled(True)
-        self.input_polarity_mode.setEnabled(True)
+        self.input_sample_rate.setEnabled(True)
         
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
@@ -358,7 +403,7 @@ class ElectrosprayUI(QMainWindow):
 
     @pyqtSlot(float, float)
     def update_daq_display(self, volts, amps):
-        self.lbl_voltage.setText(f"Voltage: {volts:.2f} V | Current: {amps:.6f} A")
+        self.voltage_placeholder_text.setText(f"Voltage: {volts:.2f} V | Current: {amps:.6f} A")
 
 # --- APP ENTRY POINT ---
 if __name__ == "__main__":
