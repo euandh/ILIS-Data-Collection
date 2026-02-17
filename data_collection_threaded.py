@@ -236,35 +236,36 @@ class DAQWorker(QThread):
                     # 1. CALCULATE OUTPUTS (Logic Block)
                     # --------------------------------------
                     
-                    # Polarity Switching Logic
-                    # Check if it is time to switch states
-                    if self.polarity_mode != "Unipolar constant": # If switching is active
-                         if (now - last_switch_time) >= self.high_time:
-                            is_high_state = not is_high_state # Toggle state
+                    # Check if in a switching mode
+                    if self.polarity_mode != "Unipolar constant":
+                        # Check if it's time to switch
+                        if (now - last_switch_time) >= self.high_time:
+                            is_high_state = not is_high_state # toggle state
                             last_switch_time = now
                     else:
-                        is_high_state = True # Always high if constant
-
-                    # Prepare list of values for AO write
+                        is_high_state = True # Always "high" if constant
+                        
                     ao_data_out = []
                     
                     for func in self.ao_ordered_functions:
                         val_to_write = 0.0
                         
                         if func == "Matsusada control":
-                            # Logic: Apply Voltage if High State
+                            # Apply positive voltage if in high state
                             if is_high_state:
-                                val_to_write = self.target_voltage / 1000.0 # 5000V -> 5V
+                                val_to_write = self.target_voltage/1000 # Convert to scaled control voltage
                             else:
+                                # Apply the negative voltage if in low state in bipolar
                                 if self.polarity_mode == "Bipolar switching":
-                                    val_to_write = -1 * (self.target_voltage / 1000.0)
-                                else: # Unipolar switching (Low = 0V)
+                                    val_to_write = -1 * self.target_voltage/1000
+                                # Apply zero if in unipolar switching
+                                elif self.polarity_mode == "Unipolar switching":
                                     val_to_write = 0.0
-                                    
-                        elif func == "Camera control":
-                            # Example: Trigger camera if High State
-                            val_to_write = 5.0 if is_high_state else 0.0
-                            
+                                else:
+                                    val_to_write = 0.0
+                                    self.log_message.emit(f"NO MATCHING POLARITY MODE: {self.polarity_mode}")
+                        
+                        self.log_message.emit(f"AO Voltage: {val_to_write}")
                         ao_data_out.append(val_to_write)
 
                     # WRITE AO (if channels exist)
@@ -738,6 +739,11 @@ class ElectrosprayUI(QMainWindow):
         self.daq_worker.ao_map = self.hw_config.get("ao_map", {}) 
         self.daq_worker.ai_map = self.hw_config.get("ai_map", {})
         
+        # Force update to live settings
+        self.daq_worker.set_voltage(self.input_voltage.value())
+        self.daq_worker.set_hightime(self.input_high_time.value())
+        self.daq_worker.set_polarity_mode(self.input_polarity_mode.currentText())
+        
         # Start Threads
         if use_cam == True:
             self.cam_worker.start()
@@ -781,7 +787,8 @@ class ElectrosprayUI(QMainWindow):
         self.daq_worker.set_hightime(value)
         
     def update_DAQ_polarity_mode(self, value):
-        self.daq_worker.set_polarity_mode(value)
+        text = self.input_polarity_mode.currentText()
+        self.daq_worker.set_polarity_mode(text)
 
     def open_hardware_config(self):
         # Pass the dictionary to the dialog so it can read/write to it
@@ -789,6 +796,7 @@ class ElectrosprayUI(QMainWindow):
         if dialog.exec():
             self.append_log("Hardware configuration updated.")
             self.append_log(f"Current AI Device: {self.hw_config['ai_device']}")
+            self.append_log(f"Current AO Device: {self.hw_config['ao_device']}")
 
     def stop_system(self):
         self.append_log("Stopping...")
