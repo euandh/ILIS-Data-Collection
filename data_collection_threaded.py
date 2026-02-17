@@ -40,7 +40,8 @@ import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QComboBox, QLineEdit,
                              QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog,
-                             QGroupBox, QGridLayout)
+                             QGroupBox, QGridLayout, QDialog, QFormLayout,
+                             QDialogButtonBox)
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt
 
 # National Instruments Libraries
@@ -136,9 +137,14 @@ class DAQWorker(QThread):
         self.ai_channel_name = "cDAQ9185-2023AF4Mod1"
         self.ao_channel_name = "cDAQ9185-2023AF4Mod2"
         self.ai_channels_to_use = [0, 1]
-        self.ao_channels_to_use = [0, 1]
+        self.ao_channels_to_use = [0]
         self.ai_lims = [-10, 10]
         self.ao_lims = [-10, 10]
+        
+        # Define channels for purposes
+        self.ai_channel_assignments = {
+                                      "Matsusada": 0  
+                                      }
 
     def set_voltage(self, val):
         self.target_voltage = val
@@ -181,6 +187,10 @@ class DAQWorker(QThread):
                 writer = csv.writer(f)
                 
                 while self.is_running:
+                    # --- Update voltage to PSU --- 
+                    self.ao_task.write([self.target_voltage/1000])
+                    
+                    
                     # --- Read/Write Logic ---
                     # Need to add actual .read() and .write() calls here eventually
                     read_volts = self.target_voltage
@@ -198,6 +208,12 @@ class DAQWorker(QThread):
         finally:
             # CLEANUP
             self.log_message.emit("Stopping DAQ tasks...")
+            
+            # Set AOs to zero
+            try:
+                self.ao_task.write([0])
+            except:
+                print("error lol")
             
             # Close AI
             try:
@@ -218,6 +234,46 @@ class DAQWorker(QThread):
     def stop(self):
         self.is_running = False
         self.wait()
+
+# --- HARDWARE CONFIGURATION DIALOGUE ---
+class HardwareConfigDialog(QDialog):
+    def __init__(self, current_config, parent = None):
+        super().__init__(parent)
+        self.setWindowTitle("Hardware and Channel Settings")
+        self.resize(400, 200)
+        
+        # Variable to store the configuration
+        self.config = current_config
+        
+        self.layout = QFormLayout(self)
+        
+        # Inputs
+            # AI Card
+        self.input_device_ai = QLineEdit(self.config.get("ai_device", "cDAQ9185-2023AF4Mod1"))
+        self.input_chans_ai = QLineEdit(self.config.get("ai_channels", "0, 1"))
+        self.input_chans_ai.setPlaceholderText("e.g. 0, 1, 2")
+
+        self.input_device_ao = QLineEdit(self.config.get("ao_device", "cDAQ9185-2023AF4Mod2"))
+        self.input_chans_ao = QLineEdit(self.config.get("ao_channels", "0, 1"))
+        
+        self.layout.addRow("AI Device Name:", self.input_device_ai)
+        self.layout.addRow("AI Channels (csv):", self.input_chans_ai)
+        self.layout.addRow("AO Device Name:", self.input_device_ao)
+        self.layout.addRow("AO Channels (csv):", self.input_chans_ao)
+
+        # UI Buttons (OK | Cancel)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.save_and_close)
+        self.buttons.rejected.connect(self.reject)
+        self.layout.addRow(self.buttons)
+        
+    def save_and_close(self):
+        # Update the dictionary with new values
+        self.config["ai_device"] = self.input_device_ai.text()
+        self.config["ao_device"] = self.input_device_ao.text()
+        self.config["ai_channels"] = self.input_chans_ai.text()
+        self.config["ao_channels"] = self.input_chans_ao.text()
+        self.accept() # Closes window and returns "True" result
 
 # --- MAIN GUI WINDOW ---
 class ElectrosprayUI(QMainWindow):
@@ -378,11 +434,26 @@ class ElectrosprayUI(QMainWindow):
         self.feeds_layout.addWidget(self.group_plots, stretch = 1)
         self.main_layout.addLayout(self.feeds_layout, stretch = 2)
 
-        # 2. Initialize Workers
+        # Menu Bar and Hardware Config Menu/Dialogue
+        self.hw_config = {
+                         "ai_device": "cDAQ9185-2023AF4Mod1",
+                         "ai_channels": "0, 1",
+                         "ao_device": "cDAQ9185-2023AF4Mod2",
+                         "ao_channels": "0, 1"  
+                         }       
+        
+        self.menubar = self.menuBar()
+        self.config_menu = self.menubar.addMenu("Configuration")
+        
+            #actions
+        action_hardware = self.config_menu.addAction("Hardware connections...")
+        action_hardware.triggered.connect(self.open_hardware_config)
+        
+        # Initialize Workers
         self.cam_worker = CameraWorker()
         self.daq_worker = DAQWorker()
 
-        # 3. Connect Signals (Worker -> GUI)
+        # Connect Signals (Worker -> GUI)
         self.cam_worker.log_message.connect(self.append_log)
         self.cam_worker.image_ready.connect(self.update_image_display) # You need to write this function
         self.daq_worker.data_ready.connect(self.update_daq_display)
@@ -421,10 +492,26 @@ class ElectrosprayUI(QMainWindow):
         self.inputted_fps = self.input_fps.value()
         self.inputted_filepath = self.input_filepath.text()
         
+        # Parse Configuration from Settings
+        try:
+            ai_chans = [int(x.strip()) for x in self.hw_config["ai_channels"].split(',')]
+            ao_chans = [int(x.strip()) for x in self.hw_config["ao_channels"].split(',')]
+        except ValueError:
+            self.append_log("Error parsing channels! Check config format (e.g. '0, 1').")
+            self.btn_start.setEnabled(True) # Re-enable start button
+            return
+
+            # Update workers
+        self.daq_worker.ai_channel_name = self.hw_config["ai_device"]
+        self.daq_worker.ao_channel_name = self.hw_config["ao_device"]
+        self.daq_worker.ai_channels_to_use = ai_chans
+        self.daq_worker.ao_channels_to_use = ao_chans
+        
         # Start Threads
         self.daq_worker.start()
         if use_cam == True:
             self.cam_worker.start()
+            
 
     def update_DAQ_voltage(self, value):
         self.daq_worker.set_voltage(value)
@@ -434,6 +521,13 @@ class ElectrosprayUI(QMainWindow):
         
     def update_DAQ_polarity_mode(self, value):
         self.daq_worker.set_polarity_mode(value)
+
+    def open_hardware_config(self):
+        # Pass the dictionary to the dialog so it can read/write to it
+        dialog = HardwareConfigDialog(self.hw_config, self)
+        if dialog.exec():
+            self.append_log("Hardware configuration updated.")
+            self.append_log(f"Current AI Device: {self.hw_config['ai_device']}")
 
     def stop_system(self):
         self.append_log("Stopping...")
