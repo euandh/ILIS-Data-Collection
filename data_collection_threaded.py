@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog,
                              QGroupBox, QGridLayout, QDialog, QFormLayout,
                              QDialogButtonBox)
-from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt, QSettings
 
 # National Instruments Libraries
 import nidaqmx
@@ -142,9 +142,8 @@ class DAQWorker(QThread):
         self.ao_lims = [-10, 10]
         
         # Define channels for purposes
-        self.ai_channel_assignments = {
-                                      "Matsusada": 0  
-                                      }
+        self.ao_map = {}
+        self.ai_map = {}
 
     def set_voltage(self, val):
         self.target_voltage = val
@@ -158,76 +157,182 @@ class DAQWorker(QThread):
     def run(self):
         self.is_running = True
         
-        # Create NI Tasks
+        # 1. Create Tasks
         self.ai_task = nidaqmx.Task()
         self.ao_task = nidaqmx.Task()
 
         try:
-            # Setup Channels
-            for i in self.ai_channels_to_use:
+            # --- SETUP PHASE: Build the Channel Maps ---
+            
+            # Lists to ensure we write/read in the exact order NI expects
+            self.ai_ordered_functions = [] 
+            self.ao_ordered_functions = []
+            
+            # CSV Headers start with Timestamp
+            csv_headers = ["Timestamp"]
+
+            # --- A. Setup AI Channels (Sorted Order) ---
+            sorted_ai = sorted(self.ai_channels_to_use)
+            for chan_idx in sorted_ai:
+                # Add physical channel
                 self.ai_task.ai_channels.add_ai_voltage_chan(
-                    f"{self.ai_channel_name}/ai{i}", 
+                    f"{self.ai_channel_name}/ai{chan_idx}", 
                     min_val=self.ai_lims[0], max_val=self.ai_lims[1]
                 )
-            self.log_message.emit(f"AI channels {self.ai_channels_to_use} added.")
+                
+                # Identify function (e.g. "Matsusada read in")
+                func_name = "Unknown"
+                # Look for this index in the map values
+                for name, mapped_idx in self.ai_map.items():
+                    if int(mapped_idx) == chan_idx:
+                        func_name = name
+                        break
+                
+                self.ai_ordered_functions.append(func_name)
+                csv_headers.append(f"{func_name} (AI{chan_idx})")
+                
+            self.log_message.emit(f"AI Configured: {self.ai_ordered_functions}")
 
-            for i in self.ao_channels_to_use:
+            # --- B. Setup AO Channels (Sorted Order) ---
+            sorted_ao = sorted(self.ao_channels_to_use)
+            for chan_idx in sorted_ao:
+                # Add physical channel
                 self.ao_task.ao_channels.add_ao_voltage_chan(
-                    f"{self.ao_channel_name}/ao{i}", 
+                    f"{self.ao_channel_name}/ao{chan_idx}", 
                     min_val=self.ao_lims[0], max_val=self.ao_lims[1]
                 )
-            self.log_message.emit(f"AO channels {self.ao_channels_to_use} added.")
-            
-            # Create File Header
+                
+                # Identify function (e.g. "Matsusada control")
+                func_name = "Unknown"
+                for name, mapped_idx in self.ao_map.items():
+                    if int(mapped_idx) == chan_idx:
+                        func_name = name
+                        break
+                        
+                self.ao_ordered_functions.append(func_name)
+                csv_headers.append(f"{func_name} (AO{chan_idx})")
+                
+            self.log_message.emit(f"AO Configured: {self.ao_ordered_functions}")
+
+            # --- C. Initialize CSV ---
+            # Create file with the dynamic headers
             with open(self.filepath, mode='w', newline='') as f:
-                csv.writer(f).writerow(["Timestamp", "Requested Voltage", "Applied Voltage", "Collected Current"])
+                csv.writer(f).writerow(csv_headers)
             
-            # Main Loop
+            self.log_message.emit("DAQ Started. Logging data...")
+
+            # --- D. Initialize Timing Variables ---
+            last_switch_time = time.time()
+            is_high_state = True
+
+            # --- E. MAIN LOOP ---
             with open(self.filepath, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 
                 while self.is_running:
-                    # --- Update voltage to PSU --- 
-                    self.ao_task.write([self.target_voltage/1000])
+                    now = time.time()
                     
+                    # --------------------------------------
+                    # 1. CALCULATE OUTPUTS (Logic Block)
+                    # --------------------------------------
                     
-                    # --- Read/Write Logic ---
-                    # Need to add actual .read() and .write() calls here eventually
-                    read_volts = self.target_voltage
-                    read_current = read_volts / 1000 
+                    # Polarity Switching Logic
+                    # Check if it is time to switch states
+                    if self.polarity_mode != "Unipolar constant": # If switching is active
+                         if (now - last_switch_time) >= self.high_time:
+                            is_high_state = not is_high_state # Toggle state
+                            last_switch_time = now
+                    else:
+                        is_high_state = True # Always high if constant
+
+                    # Prepare list of values for AO write
+                    ao_data_out = []
                     
-                    # Write to open file
-                    writer.writerow([datetime.datetime.now(), self.target_voltage, read_volts, read_current])
+                    for func in self.ao_ordered_functions:
+                        val_to_write = 0.0
+                        
+                        if func == "Matsusada control":
+                            # Logic: Apply Voltage if High State
+                            if is_high_state:
+                                val_to_write = self.target_voltage / 1000.0 # 5000V -> 5V
+                            else:
+                                if self.polarity_mode == "Bipolar switching":
+                                    val_to_write = -1 * (self.target_voltage / 1000.0)
+                                else: # Unipolar switching (Low = 0V)
+                                    val_to_write = 0.0
+                                    
+                        elif func == "Camera control":
+                            # Example: Trigger camera if High State
+                            val_to_write = 5.0 if is_high_state else 0.0
+                            
+                        ao_data_out.append(val_to_write)
+
+                    # WRITE AO (if channels exist)
+                    if ao_data_out:
+                        self.ao_task.write(ao_data_out)
+
+                    # --------------------------------------
+                    # 2. READ INPUTS
+                    # --------------------------------------
                     
+                    # Read all AI channels at once
+                    # Returns a list of floats, e.g. [0.004, 2.5]
+                    if self.ai_channels_to_use:
+                        ai_data_in = self.ai_task.read()
+                        
+                        # Handle single channel case (nidaq returns float, not list)
+                        if not isinstance(ai_data_in, list):
+                            ai_data_in = [ai_data_in]
+                    else:
+                        ai_data_in = []
+
+                    # --------------------------------------
+                    # 3. LOGGING & UPDATE
+                    # --------------------------------------
+                    
+                    # Construct CSV Row: Timestamp + Inputs + Outputs
+                    row_data = [datetime.datetime.now()] + ai_data_in + ao_data_out
+                    writer.writerow(row_data)
+                    
+                    # Update GUI Display
+                    # We need to find the "Meaningful" values to send to the UI
+                    # (e.g. Find which channel is Voltage and which is Current)
+                    display_volts = 0.0
+                    display_current = 0.0
+                    
+                    for i, func in enumerate(self.ai_ordered_functions):
+                        if func == "Matsusada read in":
+                            # Convert 5V back to 5000V for display
+                            display_volts = ai_data_in[i] * 1000 
+                        elif "current" in func.lower():
+                            display_current = ai_data_in[i]
+
+                    # Emit signal to GUI
+                    self.data_ready.emit(display_volts, display_current)
+                    
+                    # Pace the loop
                     time.sleep(self.sample_rate)
-                    self.data_ready.emit(read_volts, read_current)
 
         except Exception as e:
-            self.log_message.emit(f"DAQ Error: {e}")
+            self.log_message.emit(f"DAQ Runtime Error: {e}")
+            print(e) # Print to console for debugging
 
         finally:
             # CLEANUP
             self.log_message.emit("Stopping DAQ tasks...")
             
-            # Set AOs to zero
             try:
-                self.ao_task.write([0])
-            except:
-                print("error lol")
-            
-            # Close AI
-            try:
-                self.ai_task.stop()
-                self.ai_task.close() 
-            except:
-                pass
+                # Zero the outputs for safety
+                if self.ao_channels_to_use:
+                    zero_list = [0.0] * len(self.ao_channels_to_use)
+                    self.ao_task.write(zero_list)
                 
-            # Close AO
-            try:
                 self.ao_task.stop()
-                self.ao_task.close() 
-            except:
-                pass
+                self.ao_task.close()
+                self.ai_task.stop()
+                self.ai_task.close()
+            except Exception as e:
+                print(f"Cleanup error: {e}")
                 
             self.log_message.emit("DAQ resources released.")
 
@@ -237,43 +342,134 @@ class DAQWorker(QThread):
 
 # --- HARDWARE CONFIGURATION DIALOGUE ---
 class HardwareConfigDialog(QDialog):
-    def __init__(self, current_config, parent = None):
+    def __init__(self, current_config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Hardware and Channel Settings")
-        self.resize(400, 200)
+        self.resize(600, 300) # Made it wider to fit side-by-side
         
-        # Variable to store the configuration
         self.config = current_config
         
-        self.layout = QFormLayout(self)
+        # Main Layout (Vertical)
+        self.main_layout = QVBoxLayout(self)
+        self.intro_text = QLabel("Input the module names (as listed in NI MAX), and then select what each channel is connected to from the dropdowns. If nothing is connected, then leave the channel as 'None'.")
+        self.intro_text.setWordWrap(True)
+        self.main_layout.addWidget(self.intro_text)
         
-        # Inputs
-            # AI Card
+            # Columns Layout (Horizontal)
+            # This sits inside the main layout and puts AI and AO side-by-side
+        self.columns_layout = QHBoxLayout()
+        self.main_layout.addLayout(self.columns_layout)
+        
+                # LEFT COLUMN: AI Settings
+        self.group_AI = QGroupBox("Analogue Inputs")
+        self.layout_AI = QGridLayout()
+        self.group_AI.setLayout(self.layout_AI)
+        
+                    # Device Name Input (CRITICAL: You need this for the NI DAQ to work)
         self.input_device_ai = QLineEdit(self.config.get("ai_device", "cDAQ9185-2023AF4Mod1"))
-        self.input_chans_ai = QLineEdit(self.config.get("ai_channels", "0, 1"))
-        self.input_chans_ai.setPlaceholderText("e.g. 0, 1, 2")
+        self.layout_AI.addWidget(QLabel("Device Name:"), 0, 0)
+        self.layout_AI.addWidget(self.input_device_ai, 0, 1)
 
-        self.input_device_ao = QLineEdit(self.config.get("ao_device", "cDAQ9185-2023AF4Mod2"))
-        self.input_chans_ao = QLineEdit(self.config.get("ao_channels", "0, 1"))
+                    # Channel Dropdowns
+        self.AI_options = ["None", "Matsusada read in", "Current collector", "Extractor current"]
+                    # Store these in a list so we can access them easily later
+        self.ai_combos = []
         
-        self.layout.addRow("AI Device Name:", self.input_device_ai)
-        self.layout.addRow("AI Channels (csv):", self.input_chans_ai)
-        self.layout.addRow("AO Device Name:", self.input_device_ao)
-        self.layout.addRow("AO Channels (csv):", self.input_chans_ao)
+                    # Load in saved options
+        saved_ai_map = self.config.get("ai_map", {})
+        
+        for i in range(4): # Cycle through the saved map and update the combo box with aligned values
+            lbl = QLabel(f"AI {i}")
+            combo = QComboBox()
+            combo.addItems(self.AI_options)
+            
+            for name, channel_idx in saved_ai_map.items():
+                if int(channel_idx) == i:
+                    combo.setCurrentText(name)
+                    break
+            
+            self.ai_combos.append(combo)
+            self.layout_AI.addWidget(lbl, i+1, 0)
+            self.layout_AI.addWidget(combo, i+1, 1)
 
-        # UI Buttons (OK | Cancel)
+                    # Add the GROUP BOX to the layout (not the inner layout)
+        self.columns_layout.addWidget(self.group_AI)
+
+        # RIGHT COLUMN: AO Settings
+        self.group_AO = QGroupBox("Analogue Outputs")
+        self.layout_AO = QGridLayout()
+        self.group_AO.setLayout(self.layout_AO)
+
+            # Device Name Input
+        self.input_device_ao = QLineEdit(self.config.get("ao_device", "cDAQ9185-2023AF4Mod2"))
+        self.layout_AO.addWidget(QLabel("Device Name:"), 0, 0)
+        self.layout_AO.addWidget(self.input_device_ao, 0, 1)
+
+            # Channel Dropdowns
+        self.AO_options = ["None", "Matsusada control", "Camera control"]
+        self.ao_combos = []
+        
+        saved_ao_map = self.config.get("ao_map", {})
+
+        for i in range(4): # Cycle through and pre-fill from saved options
+            lbl = QLabel(f"AO {i}")
+            combo = QComboBox()
+            combo.addItems(self.AO_options)
+            
+            for name, channel_idx in saved_ao_map.items():
+                if int(channel_idx) == i:
+                    combo.setCurrentText(name)
+                    break
+
+            self.ao_combos.append(combo)
+            self.layout_AO.addWidget(lbl, i+1, 0)
+            self.layout_AO.addWidget(combo, i+1, 1)
+
+            # Add the GROUP BOX to the layout
+        self.columns_layout.addWidget(self.group_AO)
+
+        # BOTTOM: OK / Cancel Buttons
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.save_and_close)
         self.buttons.rejected.connect(self.reject)
-        self.layout.addRow(self.buttons)
         
+        self.main_layout.addWidget(self.buttons)
+
     def save_and_close(self):
-        # Update the dictionary with new values
+        # 1. Save Device Names
         self.config["ai_device"] = self.input_device_ai.text()
         self.config["ao_device"] = self.input_device_ao.text()
-        self.config["ai_channels"] = self.input_chans_ai.text()
-        self.config["ao_channels"] = self.input_chans_ao.text()
-        self.accept() # Closes window and returns "True" result
+        
+        # 2. Build the Channel Lists AND the Name Mapping
+        active_ao_channels = []
+        ao_map = {} # New Dictionary: {"Matsusada": 0, "Camera": 1}
+        
+        for i, combo in enumerate(self.ao_combos):
+            name = combo.currentText()
+            if name != "None":
+                active_ao_channels.append(str(i))
+                # Map the functional name to the channel index
+                ao_map[name] = i 
+                
+        # Save simple list for the DAQ setup
+        self.config["ao_channels"] = ", ".join(active_ao_channels)
+        
+        # Save the map for the Worker logic
+        self.config["ao_map"] = ao_map 
+        
+        # (Do the same for AI if you need to read specific inputs by name)
+        active_ai_channels = []
+        ai_map = {}
+        for i, combo in enumerate(self.ai_combos):
+            name = combo.currentText()
+            if name != "None":
+                active_ai_channels.append(str(i))
+                ai_map[name] = i
+                
+        self.config["ai_channels"] = ", ".join(active_ai_channels)
+        self.config["ai_map"] = ai_map
+
+        self.accept()
 
 # --- MAIN GUI WINDOW ---
 class ElectrosprayUI(QMainWindow):
@@ -434,21 +630,6 @@ class ElectrosprayUI(QMainWindow):
         self.feeds_layout.addWidget(self.group_plots, stretch = 1)
         self.main_layout.addLayout(self.feeds_layout, stretch = 2)
 
-        # Menu Bar and Hardware Config Menu/Dialogue
-        self.hw_config = {
-                         "ai_device": "cDAQ9185-2023AF4Mod1",
-                         "ai_channels": "0, 1",
-                         "ao_device": "cDAQ9185-2023AF4Mod2",
-                         "ao_channels": "0, 1"  
-                         }       
-        
-        self.menubar = self.menuBar()
-        self.config_menu = self.menubar.addMenu("Configuration")
-        
-            #actions
-        action_hardware = self.config_menu.addAction("Hardware connections...")
-        action_hardware.triggered.connect(self.open_hardware_config)
-        
         # Initialize Workers
         self.cam_worker = CameraWorker()
         self.daq_worker = DAQWorker()
@@ -458,6 +639,40 @@ class ElectrosprayUI(QMainWindow):
         self.cam_worker.image_ready.connect(self.update_image_display) # You need to write this function
         self.daq_worker.data_ready.connect(self.update_daq_display)
         self.daq_worker.log_message.connect(self.append_log)
+
+
+        # Recall previous settings values
+        self.settings = QSettings("config.ini", QSettings.Format.IniFormat)
+        
+            # restore values
+                # filepath
+        self.input_filepath.setText(self.settings.value("filepath", ""))
+        self.input_fps.setValue(float(self.settings.value("fps", 10.0)))
+                # ROI
+        self.input_ROI_width.setValue(int(self.settings.value("roi_w", 4096)))
+        self.input_ROI_height.setValue(int(self.settings.value("roi_h", 3000)))   
+                # Voltage Controls
+        self.input_voltage.setValue(float(self.settings.value("voltage", 0.0)))
+        self.input_high_time.setValue(float(self.settings.value("high_time", 1.0)))
+        self.input_polarity_mode.setCurrentIndex(int(self.settings.value("polarity_idx", 0)))
+        
+        self.hw_config = {
+            "ai_device": self.settings.value("ai_device", "cDAQ9185-2023AF4Mod1"),
+            "ai_channels": self.settings.value("ai_channels", "0, 1"),
+            "ao_device": self.settings.value("ao_device", "cDAQ9185-2023AF4Mod2"),
+            "ao_channels": self.settings.value("ao_channels", "0, 1"),
+            # Load maps if they exist, else empty dict
+            "ai_map": self.settings.value("ai_map", {}),
+            "ao_map": self.settings.value("ao_map", {})
+        }
+
+        # Menu Bar and Hardware Config Menu/Dialogue
+        self.menubar = self.menuBar()
+        self.config_menu = self.menubar.addMenu("Configuration")
+        
+            #actions
+        action_hardware = self.config_menu.addAction("Hardware connections...")
+        action_hardware.triggered.connect(self.open_hardware_config)
 
     def start_system(self):
         # UI Updates
@@ -493,25 +708,71 @@ class ElectrosprayUI(QMainWindow):
         self.inputted_filepath = self.input_filepath.text()
         
         # Parse Configuration from Settings
+        ai_str = self.hw_config.get("ai_channels", "")   # Using .get() to avoid crashes if keys are missing
+        ao_str = self.hw_config.get("ao_channels", "")
+
         try:
-            ai_chans = [int(x.strip()) for x in self.hw_config["ai_channels"].split(',')]
-            ao_chans = [int(x.strip()) for x in self.hw_config["ao_channels"].split(',')]
+            # Split by comma, strip whitespace, and ignore empty strings
+            # This handles "0, 1" AND "" safely.
+            
+            if ai_str.strip():
+                ai_chans = [int(x.strip()) for x in ai_str.split(',') if x.strip()]
+            else:
+                ai_chans = [] # Empty list if string is empty
+
+            if ao_str.strip():
+                ao_chans = [int(x.strip()) for x in ao_str.split(',') if x.strip()]
+            else:
+                ao_chans = []
+                
         except ValueError:
-            self.append_log("Error parsing channels! Check config format (e.g. '0, 1').")
-            self.btn_start.setEnabled(True) # Re-enable start button
+            self.append_log("Error parsing channels! Check config format.")
+            self.btn_start.setEnabled(True) 
             return
 
             # Update workers
         self.daq_worker.ai_channel_name = self.hw_config["ai_device"]
         self.daq_worker.ao_channel_name = self.hw_config["ao_device"]
-        self.daq_worker.ai_channels_to_use = ai_chans
+        self.daq_worker.ai_channels_to_use = ai_chans 
         self.daq_worker.ao_channels_to_use = ao_chans
+        self.daq_worker.ao_map = self.hw_config.get("ao_map", {}) 
+        self.daq_worker.ai_map = self.hw_config.get("ai_map", {})
         
         # Start Threads
-        self.daq_worker.start()
         if use_cam == True:
             self.cam_worker.start()
+        self.daq_worker.start()
+        
             
+    def closeEvent(self, event):
+        """
+        Runs automatically when the user clicks 'X'.
+        """
+        
+        # Safety Check: Is the experiment still running?
+        if self.daq_worker.is_running or self.cam_worker.is_running:
+            self.stop_system() # Force a safe shutdown of hardware
+            time.sleep(0.5)    # Give threads a tiny moment to close file handles
+            
+        # Save all settings to file
+        self.settings.setValue("filepath", self.input_filepath.text())
+        self.settings.setValue("fps", self.input_fps.value())
+        self.settings.setValue("roi_w", self.input_ROI_width.value())
+        self.settings.setValue("roi_h", self.input_ROI_height.value())
+        self.settings.setValue("voltage", self.input_voltage.value())
+        self.settings.setValue("high_time", self.input_high_time.value())
+        self.settings.setValue("polarity_idx", self.input_polarity_mode.currentIndex())
+        
+        # Save Hardware Config
+        self.settings.setValue("ai_device", self.hw_config.get("ai_device"))
+        self.settings.setValue("ai_channels", self.hw_config.get("ai_channels"))
+        self.settings.setValue("ao_device", self.hw_config.get("ao_device"))
+        self.settings.setValue("ao_channels", self.hw_config.get("ao_channels"))
+        self.settings.setValue("ai_map", self.hw_config.get("ai_map"))
+        self.settings.setValue("ao_map", self.hw_config.get("ao_map"))
+        
+        # Close up
+        event.accept()
 
     def update_DAQ_voltage(self, value):
         self.daq_worker.set_voltage(value)
