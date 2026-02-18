@@ -74,7 +74,7 @@ class CameraWorker(QThread):
         
         # Settings
         self.exposure_time_us = 2000 # 2ms default timeout
-        self.trigger_mode = "Software"
+        self.trigger_mode = "Hardware"
         self.ROI = [4096, 3000] # Full sensor
         self.filepath = ""
 
@@ -102,11 +102,18 @@ class CameraWorker(QThread):
             
             # 2. Configure Camera
             self.camera.exposure_time_us = self.exposure_time_us
-            self.camera.frames_per_trigger_zero_for_unlimited = 0 
             self.camera.image_poll_timeout_ms = 1000 # Wait 1s for a frame
+            
+            if self.trigger_mode == "Hardware":
+                self.camera.operation_mode = 1
+                self.camera.frames_per_trigger_zero_for_unlimited = 1
+            else:
+                self.camera.operation_mode = 0
+                self.camera.frames_per_trigger_zero_for_unlimited = 0
+            
             self.camera.arm(2) # 2 frames buffer
             
-            self.log_message.emit(f"Camera: Armed ({self.camera.name})")
+            self.log_message.emit(f"Camera: Armed ({self.camera.name} in {self.trigger_mode} mode.)")
 
             # 3. Continuous Loop
             # Trigger first frame if in Software mode
@@ -302,6 +309,13 @@ class DAQWorker(QThread):
                                 else:
                                     val_to_write = 0.0
                                     self.log_message.emit(f"NO MATCHING POLARITY MODE: {self.polarity_mode}")
+                        elif func == "Camera control":
+                            trigger_period = 0.1 # 100ms
+                            if (now % trigger_period) < (trigger_period / 2):
+                                val_to_write = 5.0 # High (Trigger)
+                            else:
+                                val_to_write = 0.0 # Low (Reset)
+                         
                         
                         #self.log_message.emit(f"AO Voltage: {val_to_write}")
                         ao_data_out.append(val_to_write)
@@ -786,7 +800,7 @@ class ElectrosprayUI(QMainWindow):
         # Check if camera is in use
         if "Camera" in self.combo_mode.currentText():
             use_cam = True
-            self.cam_worker.trigger_mode = "Software"
+            self.cam_worker.trigger_mode = "Hardware"
             self.append_log("Mode: Camera + DAQ") 
         else:
             use_cam = False
