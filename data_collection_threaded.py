@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog,
                              QGroupBox, QGridLayout, QDialog, QFormLayout,
                              QDialogButtonBox)
-from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt, QSettings
+from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt, QSettings, QRectF
 import pyqtgraph as pg
 from collections import deque
 
@@ -513,7 +513,6 @@ class HardwareConfigDialog(QDialog):
         # Save the map for the Worker logic
         self.config["ao_map"] = ao_map 
         
-        # (Do the same for AI if you need to read specific inputs by name)
         active_ai_channels = []
         ai_map = {}
         for i, combo in enumerate(self.ai_combos):
@@ -529,83 +528,168 @@ class HardwareConfigDialog(QDialog):
 
 class menu_camera_settings(QDialog):
     """
-    Configuration window for setting up camera settings.
+    Configuration window for setting up camera settings with Visual ROI.
     """
-    def __init__(self, current_config, parent=None):
+    def __init__(self, current_config, camera_worker, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Camera Settings")
-        self.resize(500, 350)
+        self.setWindowTitle("Camera Settings & ROI Selection")
+        self.resize(1000, 600)
         
-        self.config = current_config 
+        self.config = current_config
+        self.worker = camera_worker 
         
-        self.main_layout = QVBoxLayout(self)
+        # --- UI SETUP  ---
+        self.main_layout = QHBoxLayout(self)
         
-        # --- General Settings ---
+        # LEFT PANEL
+        self.left_panel = QWidget()
+        self.layout_left = QVBoxLayout(self.left_panel)
+        self.main_layout.addWidget(self.left_panel, 1)
+        
+        # General Settings
         self.group_gen = QGroupBox("General Settings")
         self.layout_gen = QGridLayout()
         self.group_gen.setLayout(self.layout_gen)
         
-        # FPS Input
-        # Get value (default 10.0)
-        current_fps = float(self.config.get("fps", 10.0)) 
         self.input_fps = QDoubleSpinBox()
         self.input_fps.setRange(0.1, 100.0)
-        self.input_fps.setValue(current_fps)
+        self.input_fps.setValue(float(self.config.get("fps", 10.0)))
         self.layout_gen.addWidget(QLabel("Target FPS:"), 0, 0)
         self.layout_gen.addWidget(self.input_fps, 0, 1)
         
-        # Trigger Mode Input
-        current_trigger = self.config.get("trigger_mode", "Software")
         self.input_trigger = QComboBox()
         self.input_trigger.addItems(["Software", "Hardware"])
-        self.input_trigger.setCurrentText(current_trigger)
+        self.input_trigger.setCurrentText(self.config.get("trigger_mode", "Software"))
         self.layout_gen.addWidget(QLabel("Trigger Mode:"), 1, 0)
         self.layout_gen.addWidget(self.input_trigger, 1, 1)
         
-        self.main_layout.addWidget(self.group_gen)
+        self.layout_left.addWidget(self.group_gen)
 
-        # --- ROI Settings ---
-        self.group_roi = QGroupBox("Region of Interest (ROI)")
+        # ROI Settings
+        self.group_roi = QGroupBox("Region of Interest")
         self.layout_roi = QGridLayout()
         self.group_roi.setLayout(self.layout_roi)
         
-        # Get current values - defaults to full sensor 4096x3000
-        curr_w = int(self.config.get("roi_w", 4096))
-        curr_h = int(self.config.get("roi_h", 3000))
+        self.curr_w = int(self.config.get("roi_w", 4096))
+        self.curr_h = int(self.config.get("roi_h", 3000))
         
-        # Width
-        self.input_width = QSpinBox()
-        self.input_width.setRange(1, 4096)
-        self.input_width.setValue(curr_w)
-        self.input_width.setSuffix(" px")
+        self.spin_w = QSpinBox()
+        self.spin_w.setRange(260, 4096)
+        self.spin_w.setValue(self.curr_w)
+        self.spin_w.setSuffix(" px")
+        self.spin_w.valueChanged.connect(self.update_roi_from_spinbox)
+        
+        self.spin_h = QSpinBox()
+        self.spin_h.setRange(4, 3000)
+        self.spin_h.setValue(self.curr_h)
+        self.spin_h.setSuffix(" px")
+        self.spin_h.valueChanged.connect(self.update_roi_from_spinbox)
+
         self.layout_roi.addWidget(QLabel("Width:"), 0, 0)
-        self.layout_roi.addWidget(self.input_width, 0, 1)
-
-        # Height
-        self.input_height = QSpinBox()
-        self.input_height.setRange(1, 3000)
-        self.input_height.setValue(curr_h)
-        self.input_height.setSuffix(" px")
+        self.layout_roi.addWidget(self.spin_w, 0, 1)
         self.layout_roi.addWidget(QLabel("Height:"), 1, 0)
-        self.layout_roi.addWidget(self.input_height, 1, 1)
+        self.layout_roi.addWidget(self.spin_h, 1, 1)
         
-        self.main_layout.addWidget(self.group_roi)
-
-        # --- Bottom Buttons ---
+        self.layout_left.addWidget(self.group_roi)
+        
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.accepted.connect(self.save_and_close)
         self.buttons.rejected.connect(self.reject)
-        self.main_layout.addWidget(self.buttons)
+        self.layout_left.addWidget(self.buttons)
+        self.layout_left.addStretch()
+
+        # RIGHT PANEL (Preview)
+        self.group_preview = QGroupBox("Full Sensor Preview (Drag Box to Select)")
+        self.layout_preview = QVBoxLayout()
+        self.group_preview.setLayout(self.layout_preview)
+        self.main_layout.addWidget(self.group_preview, 3)
+
+        self.cam_view = pg.ImageView(view=pg.PlotItem())
+        self.cam_view.ui.roiBtn.hide()
+        self.cam_view.ui.menuBtn.hide()
+        self.cam_view.ui.histogram.hide()
+        self.cam_view.getView().setAspectLocked(True)
+        self.cam_view.getView().invertY(True)
+        self.layout_preview.addWidget(self.cam_view)
+
+        self.roi_tool = pg.RectROI(pos=[0, 0], size=[self.curr_w, self.curr_h], 
+                                   pen=pg.mkPen('g', width=2), 
+                                   centered=True, sideScalers=True)
+        self.roi_tool.maxBounds = QRectF(0, 0, 4096, 3000)
+        self.cam_view.addItem(self.roi_tool)
+        self.roi_tool.sigRegionChangeFinished.connect(self.update_spinbox_from_roi)
+
+        self.start_preview()
+
+    def start_preview(self):
+        """Configure worker for FULL FRAME preview"""
+        # 1. Stop if running (safety)
+        if self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait() # Wait for it to actually stop
+            
+        # 2. Force worker settings for preview
+        self.worker.ROI = [4096, 3000] 
+        self.worker.trigger_mode = "Software" 
+        self.worker.exposure_time_us = 2000 
+        
+        # 3. Connect signal to the dialog
+        try:
+            self.worker.image_ready.disconnect() # Disconnect main window
+        except:
+            pass
+        self.worker.image_ready.connect(self.update_image)
+        
+        # 4. Start
+        self.worker.start()
+
+    @pyqtSlot(object)
+    def update_image(self, image_array):
+        self.cam_view.setImage(image_array.T, autoLevels=True)
+
+    def update_spinbox_from_roi(self):
+        size = self.roi_tool.size()
+        self.spin_w.blockSignals(True)
+        self.spin_h.blockSignals(True)
+        self.spin_w.setValue(int(size.x()))
+        self.spin_h.setValue(int(size.y()))
+        self.spin_w.blockSignals(False)
+        self.spin_h.blockSignals(False)
+
+    def update_roi_from_spinbox(self):
+        w = self.spin_w.value()
+        h = self.spin_h.value()
+        self.roi_tool.setSize([w, h])
 
     def save_and_close(self):
-        # CRITICAL FIX: Save the .value() or .currentText(), not the widget itself!
         self.config["fps"] = self.input_fps.value()
         self.config["trigger_mode"] = self.input_trigger.currentText()
-        self.config["roi_w"] = self.input_width.value()
-        self.config["roi_h"] = self.input_height.value()
-        
+        self.config["roi_w"] = self.spin_w.value()
+        self.config["roi_h"] = self.spin_h.value()
+        self.close_cleanly()
         self.accept()
-    
+        
+    def reject(self):
+        self.close_cleanly()
+        super().reject()
+
+    def close_cleanly(self):
+        """Helper to stop everything safely"""
+        # 1. STOP THE WORKER (Fixes the Ghost Feed)
+        if self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait()
+            
+        # 2. Disconnect signal
+        try:
+            self.worker.image_ready.disconnect(self.update_image)
+        except:
+            pass
+            
+    def closeEvent(self, event):
+        self.close_cleanly()
+        event.accept()
+ 
 # --- MAIN GUI WINDOW ---
 class ElectrosprayUI(QMainWindow):
     def __init__(self):
@@ -978,12 +1062,33 @@ class ElectrosprayUI(QMainWindow):
             self.append_log(f"Current AO Device: {self.hw_config['ao_device']}")
 
     def open_camera_config(self):
-        # Pass the dictionary to the dialog
-        dialog = menu_camera_settings(self.cam_config, self)
+        # 1. Force stop everything first
+        if self.cam_worker.isRunning():
+            self.cam_worker.stop()
+            self.cam_worker.wait() # Wait until fully stopped
+            
+        if self.daq_worker.isRunning():
+            self.daq_worker.stop()
+            self.daq_worker.wait()
+
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.combo_mode.setEnabled(True)
+
+        # 2. Temporarily disconnect Main Window signal
+        try:
+            self.cam_worker.image_ready.disconnect(self.update_image_display)
+        except TypeError:
+            pass 
+
+        # 3. Open Dialog
+        dialog = menu_camera_settings(self.cam_config, self.cam_worker, self)
         
-        # If OK clicked:
         if dialog.exec():
-            self.append_log(f"Camera Config Updated: {self.cam_config['fps']} FPS, {self.cam_config['trigger_mode']}")
+            self.append_log(f"Config Updated. ROI: {self.cam_config['roi_w']}x{self.cam_config['roi_h']}")
+            
+        # 4. Reconnect Main Window Signal
+        self.cam_worker.image_ready.connect(self.update_image_display)
 
     def stop_system(self):
         self.append_log("Stopping...")
@@ -1011,8 +1116,6 @@ class ElectrosprayUI(QMainWindow):
         # If the view is empty (first frame), Force Zoom-to-Fit
         if self.cam_view.image is None:
             self.cam_view.setImage(display_data, autoLevels=True, autoRange=True)
-            # Optional: Set a fixed brightness range (e.g. 0 to 200 for dim signals)
-            # self.cam_view.setLevels(0, 255)
         else:
             # Afterwards, keep user's zoom/pan
             self.cam_view.setImage(display_data, autoLevels=False, autoRange=False)
