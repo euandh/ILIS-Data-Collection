@@ -395,10 +395,13 @@ class DAQWorker(QThread):
 
 # --- HARDWARE CONFIGURATION DIALOGUE ---
 class HardwareConfigDialog(QDialog):
+    """
+    Configuration window for setting up NI DAQ Channels
+    """
     def __init__(self, current_config, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Hardware and Channel Settings")
-        self.resize(600, 300) # Made it wider to fit side-by-side
+        self.setWindowTitle("NI DAQ and Channel Settings")
+        self.resize(600, 300)
         
         self.config = current_config
         
@@ -418,7 +421,7 @@ class HardwareConfigDialog(QDialog):
         self.layout_AI = QGridLayout()
         self.group_AI.setLayout(self.layout_AI)
         
-                    # Device Name Input (CRITICAL: You need this for the NI DAQ to work)
+                    # Device Name Input
         self.input_device_ai = QLineEdit(self.config.get("ai_device", "cDAQ9185-2023AF4Mod1"))
         self.layout_AI.addWidget(QLabel("Device Name:"), 0, 0)
         self.layout_AI.addWidget(self.input_device_ai, 0, 1)
@@ -524,6 +527,85 @@ class HardwareConfigDialog(QDialog):
 
         self.accept()
 
+class menu_camera_settings(QDialog):
+    """
+    Configuration window for setting up camera settings.
+    """
+    def __init__(self, current_config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Camera Settings")
+        self.resize(500, 350)
+        
+        self.config = current_config 
+        
+        self.main_layout = QVBoxLayout(self)
+        
+        # --- General Settings ---
+        self.group_gen = QGroupBox("General Settings")
+        self.layout_gen = QGridLayout()
+        self.group_gen.setLayout(self.layout_gen)
+        
+        # FPS Input
+        # Get value (default 10.0)
+        current_fps = float(self.config.get("fps", 10.0)) 
+        self.input_fps = QDoubleSpinBox()
+        self.input_fps.setRange(0.1, 100.0)
+        self.input_fps.setValue(current_fps)
+        self.layout_gen.addWidget(QLabel("Target FPS:"), 0, 0)
+        self.layout_gen.addWidget(self.input_fps, 0, 1)
+        
+        # Trigger Mode Input
+        current_trigger = self.config.get("trigger_mode", "Software")
+        self.input_trigger = QComboBox()
+        self.input_trigger.addItems(["Software", "Hardware"])
+        self.input_trigger.setCurrentText(current_trigger)
+        self.layout_gen.addWidget(QLabel("Trigger Mode:"), 1, 0)
+        self.layout_gen.addWidget(self.input_trigger, 1, 1)
+        
+        self.main_layout.addWidget(self.group_gen)
+
+        # --- ROI Settings ---
+        self.group_roi = QGroupBox("Region of Interest (ROI)")
+        self.layout_roi = QGridLayout()
+        self.group_roi.setLayout(self.layout_roi)
+        
+        # Get current values - defaults to full sensor 4096x3000
+        curr_w = int(self.config.get("roi_w", 4096))
+        curr_h = int(self.config.get("roi_h", 3000))
+        
+        # Width
+        self.input_width = QSpinBox()
+        self.input_width.setRange(1, 4096)
+        self.input_width.setValue(curr_w)
+        self.input_width.setSuffix(" px")
+        self.layout_roi.addWidget(QLabel("Width:"), 0, 0)
+        self.layout_roi.addWidget(self.input_width, 0, 1)
+
+        # Height
+        self.input_height = QSpinBox()
+        self.input_height.setRange(1, 3000)
+        self.input_height.setValue(curr_h)
+        self.input_height.setSuffix(" px")
+        self.layout_roi.addWidget(QLabel("Height:"), 1, 0)
+        self.layout_roi.addWidget(self.input_height, 1, 1)
+        
+        self.main_layout.addWidget(self.group_roi)
+
+        # --- Bottom Buttons ---
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.save_and_close)
+        self.buttons.rejected.connect(self.reject)
+        self.main_layout.addWidget(self.buttons)
+
+    def save_and_close(self):
+        # CRITICAL FIX: Save the .value() or .currentText(), not the widget itself!
+        self.config["fps"] = self.input_fps.value()
+        self.config["trigger_mode"] = self.input_trigger.currentText()
+        self.config["roi_w"] = self.input_width.value()
+        self.config["roi_h"] = self.input_height.value()
+        
+        self.accept()
+    
 # --- MAIN GUI WINDOW ---
 class ElectrosprayUI(QMainWindow):
     def __init__(self):
@@ -574,20 +656,6 @@ class ElectrosprayUI(QMainWindow):
         self.static_set_layout = QGridLayout()
         self.group_static_settings.setLayout(self.static_set_layout)
         
-                # FPS
-        self.input_fps = QDoubleSpinBox()
-        self.input_fps.setValue(10)
-        self.input_fps.setRange(0, 914.4)
-        self.input_fps.setSuffix(" FPS")
-                # ROI
-        self.input_ROI_width = QSpinBox()
-        self.input_ROI_width.setMaximum(4096)        
-        self.input_ROI_width.setValue(4096)        
-        self.input_ROI_width.setSuffix(" px")  
-        self.input_ROI_height = QSpinBox()
-        self.input_ROI_height.setMaximum(3000)
-        self.input_ROI_height.setValue(3000)
-        self.input_ROI_height.setSuffix(" px")
                 # Filepath
         self.input_filepath = QLineEdit()
         self.input_filepath.setPlaceholderText("Enter filepath to folder for data logging here...")
@@ -599,20 +667,11 @@ class ElectrosprayUI(QMainWindow):
         self.input_sample_rate.setSingleStep(10)
 
                 # Add all widgets
-        self.static_set_layout.addWidget(QLabel("Frame rate:"), 0, 0)
-        self.static_set_layout.addWidget(self.input_fps, 0, 1, 1, 4)
+        self.static_set_layout.addWidget(QLabel("Save directory:"), 0, 0)
+        self.static_set_layout.addWidget(self.input_filepath, 0, 1)
         
-        self.static_set_layout.addWidget(QLabel("Region of interest:"), 1, 0)
-        self.static_set_layout.addWidget(QLabel("Width:"), 1, 1, alignment=Qt.AlignmentFlag.AlignRight)
-        self.static_set_layout.addWidget(self.input_ROI_width, 1, 2)
-        self.static_set_layout.addWidget(QLabel("Height:"), 1, 3, alignment=Qt.AlignmentFlag.AlignRight)
-        self.static_set_layout.addWidget(self.input_ROI_height, 1, 4, )
-        
-        self.static_set_layout.addWidget(QLabel("Save directory:"), 2, 0)
-        self.static_set_layout.addWidget(self.input_filepath, 2, 1, 1, 4)
-        
-        self.static_set_layout.addWidget(QLabel("Sample rate:"), 3, 0)
-        self.static_set_layout.addWidget(self.input_sample_rate, 3, 1, 1, 4)
+        self.static_set_layout.addWidget(QLabel("Sample rate:"), 1, 0)
+        self.static_set_layout.addWidget(self.input_sample_rate, 1, 1)
 
             # RIGHT: Rolling/live inputs
         self.group_live_settings = QGroupBox("Live Settings")
@@ -646,8 +705,8 @@ class ElectrosprayUI(QMainWindow):
         self.live_set_layout.addWidget(self.input_polarity_mode, 2, 1)
         
             # MAKE WHOLE ROW: Add both groups to the layout
-        self.settings_layout.addWidget(self.group_static_settings)
-        self.settings_layout.addWidget(self.group_live_settings)
+        self.settings_layout.addWidget(self.group_static_settings, 1)
+        self.settings_layout.addWidget(self.group_live_settings, 1)
         
         self.main_layout.addLayout(self.settings_layout)
 
@@ -748,11 +807,7 @@ class ElectrosprayUI(QMainWindow):
         
             # restore values
                 # filepath
-        self.input_filepath.setText(self.settings.value("filepath", ""))
-        self.input_fps.setValue(float(self.settings.value("fps", 10.0)))
-                # ROI
-        self.input_ROI_width.setValue(int(self.settings.value("roi_w", 4096)))
-        self.input_ROI_height.setValue(int(self.settings.value("roi_h", 3000)))   
+        self.input_filepath.setText(self.settings.value("filepath", ""))  
                 # Voltage Controls
         self.input_voltage.setValue(float(self.settings.value("voltage", 0.0)))
         self.input_high_time.setValue(float(self.settings.value("high_time", 1.0)))
@@ -767,14 +822,24 @@ class ElectrosprayUI(QMainWindow):
             "ai_map": self.settings.value("ai_map", {}),
             "ao_map": self.settings.value("ao_map", {})
         }
+        
+        self.cam_config = {
+            "fps": float(self.settings.value("cam_fps", 10.0)),
+            "trigger_mode": self.settings.value("cam_trigger", "Software"),
+            "roi_w": int(self.settings.value("cam_roi_w", 4096)),
+            "roi_h": int(self.settings.value("cam_roi_h", 3000))
+        }
 
         # Menu Bar and Hardware Config Menu/Dialogue
         self.menubar = self.menuBar()
         self.config_menu = self.menubar.addMenu("Configuration")
         
             #actions
-        action_hardware = self.config_menu.addAction("Hardware connections...")
+        action_hardware = self.config_menu.addAction("NI DAQ settings...")
         action_hardware.triggered.connect(self.open_hardware_config)
+        
+        action_camera = self.config_menu.addAction("Camera settings...")
+        action_camera.triggered.connect(self.open_camera_config)
 
     def start_system(self):
         # UI Updates
@@ -787,7 +852,6 @@ class ElectrosprayUI(QMainWindow):
         self.filenametime = time.strftime("ESPRAY_%Y-%m-%d_%H%M")
         
         # Lock inputs
-        self.input_fps.setEnabled(False)
         self.input_filepath.setEnabled(False)
         self.input_sample_rate.setEnabled(False)
         
@@ -810,11 +874,14 @@ class ElectrosprayUI(QMainWindow):
             # Cam worker
         if use_cam == True:
             self.cam_worker.filepath = f"{self.input_filepath.text()}/{self.filenametime}_IMAGES.tiff"
-            self.cam_worker.ROI = [self.input_ROI_width.value(), self.input_ROI_height.value()]
+            
+            self.cam_worker.ROI = [self.cam_config["roi_w"], self.cam_config["roi_h"]]
+            self.cam_worker.trigger_mode = self.cam_config["trigger_mode"]
+            
             # Daq worker
         self.daq_worker.filepath = f"{self.input_filepath.text()}/{self.filenametime}_DATA.csv"
         
-        self.inputted_fps = self.input_fps.value()
+        self.inputted_fps = self.cam_config["fps"]
         self.inputted_filepath = self.input_filepath.text()
         
         # Parse Configuration from Settings
@@ -871,9 +938,6 @@ class ElectrosprayUI(QMainWindow):
             
         # Save all settings to file
         self.settings.setValue("filepath", self.input_filepath.text())
-        self.settings.setValue("fps", self.input_fps.value())
-        self.settings.setValue("roi_w", self.input_ROI_width.value())
-        self.settings.setValue("roi_h", self.input_ROI_height.value())
         self.settings.setValue("voltage", self.input_voltage.value())
         self.settings.setValue("high_time", self.input_high_time.value())
         self.settings.setValue("polarity_idx", self.input_polarity_mode.currentIndex())
@@ -885,6 +949,12 @@ class ElectrosprayUI(QMainWindow):
         self.settings.setValue("ao_channels", self.hw_config.get("ao_channels"))
         self.settings.setValue("ai_map", self.hw_config.get("ai_map"))
         self.settings.setValue("ao_map", self.hw_config.get("ao_map"))
+        
+        # Save camera config
+        self.settings.setValue("cam_fps", self.cam_config["fps"])
+        self.settings.setValue("cam_trigger", self.cam_config["trigger_mode"])
+        self.settings.setValue("cam_roi_w", self.cam_config["roi_w"])
+        self.settings.setValue("cam_roi_h", self.cam_config["roi_h"])
         
         # Close up
         event.accept()
@@ -907,15 +977,22 @@ class ElectrosprayUI(QMainWindow):
             self.append_log(f"Current AI Device: {self.hw_config['ai_device']}")
             self.append_log(f"Current AO Device: {self.hw_config['ao_device']}")
 
+    def open_camera_config(self):
+        # Pass the dictionary to the dialog
+        dialog = menu_camera_settings(self.cam_config, self)
+        
+        # If OK clicked:
+        if dialog.exec():
+            self.append_log(f"Camera Config Updated: {self.cam_config['fps']} FPS, {self.cam_config['trigger_mode']}")
+
     def stop_system(self):
         self.append_log("Stopping...")
         self.cam_worker.stop()
         self.daq_worker.stop()
         
         # unlock inputs
-        self.input_fps.setEnabled(True)
-        self.input_filepath.setEnabled(True)
         self.input_sample_rate.setEnabled(True)
+        self.input_filepath.setEnabled(True)
         
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
