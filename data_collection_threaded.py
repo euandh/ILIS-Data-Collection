@@ -43,6 +43,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QGroupBox, QGridLayout, QDialog, QFormLayout,
                              QDialogButtonBox)
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt, QSettings
+import pyqtgraph as pg
+from collections import deque
 
 # National Instruments Libraries
 import nidaqmx
@@ -61,59 +63,95 @@ import imagecodecs
 
 # --- WORKER THREAD 1: CAMERA CONTROL ---
 class CameraWorker(QThread):
-    # Signals to send data back to the GUI
-    image_ready = pyqtSignal(object)  # Sends the image array
-    log_message = pyqtSignal(str)     # Sends text logs
+    image_ready = pyqtSignal(object)  # Sends numpy array
+    log_message = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
         self.is_running = False
+        self.camera = None
+        self.sdk = None
         
-        # Initialise control variables (with some default values)
-        self.camera_fps = 10
+        # Settings
+        self.exposure_time_us = 2000 # 2ms default timeout
+        self.trigger_mode = "Software"
+        self.ROI = [4096, 3000] # Full sensor
         self.filepath = ""
-        self.ROI = [4096, 3000]
-        self.trigger_mode = "Software" # Default
 
     def run(self):
-        """This runs when you call worker.start()"""
         self.is_running = True
         self.log_message.emit("Camera: Initializing SDK...")
-
-        # --- [INSERT YOUR THORLABS SETUP CODE HERE] ---
-        # sdk = TLCameraSDK()
-        # camera = sdk.open_camera(...)
-        # camera.arm(10)
         
-        self.log_message.emit(f"Camera: Armed in {self.trigger_mode} mode.")
+        try:
+            # 1. Initialize SDK & Camera
+            self.DLL_dr = "C:\Program Files\Thorlabs\Scientific Imaging\ThorCam"
 
-        while self.is_running:
             try:
-                # --- [INSERT YOUR FRAME CAPTURE CODE HERE] ---
-                # frame = camera.get_pending_frame_or_null()
+                windows_setup.configure_path(self.DLL_dr)
+            except ImportError:
+                configure_path = None
+            
+            self.sdk = TLCameraSDK()
+            available_cameras = self.sdk.discover_available_cameras()
+            
+            if not available_cameras:
+                self.log_message.emit("Camera: No cameras found!")
+                return
+            
+            self.camera = self.sdk.open_camera(available_cameras[0])
+            
+            # 2. Configure Camera
+            self.camera.exposure_time_us = self.exposure_time_us
+            self.camera.frames_per_trigger_zero_for_unlimited = 0 
+            self.camera.image_poll_timeout_ms = 1000 # Wait 1s for a frame
+            self.camera.arm(2) # 2 frames buffer
+            
+            self.log_message.emit(f"Camera: Armed ({self.camera.name})")
+
+            # 3. Continuous Loop
+            # Trigger first frame if in Software mode
+            if self.trigger_mode == "Software":
+                self.camera.issue_software_trigger()
+
+            while self.is_running:
+                frame = self.camera.get_pending_frame_or_null()
                 
-                # SIMULATION (Delete this block later)
-                time.sleep(0.1) # Simulate 10 FPS
-                fake_image = np.random.randint(0, 255, (1024, 1024), dtype=np.uint8)
-                
-                # Emit the data to the GUI
-                self.image_ready.emit(fake_image)
+                if frame:
+                    # 1. RESHAPE (CRITICAL STEP)
+                    # The SDK gives a flat list. We must force it into a 2D rectangle.
+                    image_data = frame.image_buffer.reshape(
+                        self.camera.image_height_pixels, 
+                        self.camera.image_width_pixels
+                    )
+                    
+                    # 2. Make a copy (Safety for threading)
+                    final_image = np.copy(image_data)
+                    
+                    # 3. Emit
+                    self.image_ready.emit(final_image)
+                    
+                    # Saving logic...
+                    if self.filepath:
+                        # tifffile handles the shape automatically
+                        tifffile.imwrite(self.filepath, final_image, append=True)
 
-                # --- [INSERT YOUR TIFF SAVING CODE HERE] ---
-                # tiff.save(data=image_data, ...)
+                    if self.trigger_mode == "Software":
+                        self.camera.issue_software_trigger()
 
-            except Exception as e:
-                self.log_message.emit(f"Camera Error: {str(e)}")
-                break
-
-        # --- [INSERT YOUR TEAR DOWN CODE HERE] ---
-        # camera.disarm()
-        # camera.dispose()
-        self.log_message.emit("Camera: Disconnected.")
+        except Exception as e:
+            self.log_message.emit(f"Camera Error: {e}")
+            
+        finally:
+            if self.camera:
+                self.camera.disarm()
+                self.camera.dispose()
+            if self.sdk:
+                self.sdk.dispose()
+            self.log_message.emit("Camera: Closed.")
 
     def stop(self):
         self.is_running = False
-        self.wait() # Wait for the thread to finish safely
+        self.wait()
 
 # --- WORKER THREAD 2: NI DAQ CONTROL ---
 class DAQWorker(QThread):
@@ -265,7 +303,7 @@ class DAQWorker(QThread):
                                     val_to_write = 0.0
                                     self.log_message.emit(f"NO MATCHING POLARITY MODE: {self.polarity_mode}")
                         
-                        self.log_message.emit(f"AO Voltage: {val_to_write}")
+                        #self.log_message.emit(f"AO Voltage: {val_to_write}")
                         ao_data_out.append(val_to_write)
 
                     # WRITE AO (if channels exist)
@@ -479,6 +517,10 @@ class ElectrosprayUI(QMainWindow):
         self.setWindowTitle("Electrospray Control and Data Acquisition")
         self.resize(1200, 800)
 
+        # PyQtGraph Settings
+        pg.setConfigOption('background', 'w')
+        pg.setConfigOption('foreground', 'k')
+
         # Start set-up of layout
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
@@ -600,26 +642,71 @@ class ElectrosprayUI(QMainWindow):
         
             # LEFT: Camera Feed (placeholder)
         self.group_cam_feed = QGroupBox("Camera Feed")
-        self.group_cam_feed.setStyleSheet("background-color: black;") # placeholder black background
         self.cam_feed_layout = QVBoxLayout()
         self.group_cam_feed.setLayout(self.cam_feed_layout)
         
-                # Placeholder label
-        self.camera_placeholder_text = QLabel("Waiting for camera...")
-        self.camera_placeholder_text.setStyleSheet("color: white; font-size:20px;")
-        self.cam_feed_layout.addWidget(self.camera_placeholder_text)
-
+            # Create imageview
+        # view=pg.PlotItem() hides the histogram/ROI tools by default for a cleaner look
+        self.cam_view = pg.ImageView(view=pg.PlotItem()) 
+        self.cam_view.ui.roiBtn.hide()        # Hide the "ROI" button
+        self.cam_view.ui.menuBtn.hide()       # Hide the "Menu" button
+        self.cam_view.ui.histogram.hide()     # Hide Histogram (CPU heavy, enable if needed)
+        self.cam_view.getView().getAxis('left').hide()
+        self.cam_view.getView().getAxis('bottom').hide()
+        self.cam_view.getView().setAspectLocked(True)
+        #self.cam_view.getView().setMenuEnabled(False) # Disable right-click menu
+        #self.cam_view.getView().setMouseEnabled(x=True, y=True) # Keep zoom/pan
+        
+        self.cam_feed_layout.addWidget(self.cam_view)
 
             # RIGHT: Plot feed (placeholder)
         self.group_plots = QGroupBox("Voltage and Current Plots")
         self.plots_layout = QVBoxLayout()
         self.group_plots.setLayout(self.plots_layout)
         
-                # Placeholder label
-        self.voltage_placeholder_text = QLabel("0.00 V")
-        self.voltage_placeholder_text.setStyleSheet("font-size: 20px;")
-        self.plots_layout.addWidget(self.voltage_placeholder_text)
-            
+                # Plot window
+                    # Set-up the rolling window data
+        self.plot_max_points = 300      # How many points to plot at once
+        self.data_time = deque(maxlen = self.plot_max_points)
+        self.data_voltage = deque(maxlen = self.plot_max_points)
+        self.data_current = deque(maxlen = self.plot_max_points)
+        self.start_time = time.time()
+        
+                    # Graph widget set-up
+        self.graph_widget = pg.GraphicsLayoutWidget()
+        self.voltage_colour = "#1f77b4"
+        self.collector_current_colour = "#ff7f0e"
+        # (Next colours in the T10 sequence are: #2ca02c, #d62728, #9467bd, #8c564b)
+        
+                    # Plot 1 - Voltage (measured)
+        self.plot_V = self.graph_widget.addPlot(row = 0, col = 0)
+        self.legend = self.plot_V.addLegend(offset = (10, 10))
+        self.legend.setBrush(pg.mkBrush(255, 255, 255, 150))
+        self.plot_V.setLabel("left", "Voltage", units = "V")
+        self.curve_V = self.plot_V.plot(pen = pg.mkPen(self.voltage_colour, width = 2), name = "Voltage")
+        self.plot_V.setLabel("bottom", "Time", units = "s")
+        
+                    # Plot 2 - Collector current
+        self.view_current = pg.ViewBox()
+        self.plot_V.scene().addItem(self.view_current)
+        self.plot_V.getAxis("right").linkToView(self.view_current)
+        self.view_current.setXLink(self.plot_V)
+        self.plot_V.showAxis("right")
+        self.plot_V.getAxis("right").setLabel("Current", units = "A")
+        self.curve_I = pg.PlotCurveItem(pen = pg.mkPen(self.collector_current_colour, width = 2))
+        self.view_current.addItem(self.curve_I)
+        self.legend.addItem(self.curve_I, "Collector current")
+        
+        def update_views():
+            # Function to update the view box to match the first (voltage)
+            self.view_current.setGeometry(self.plot_V.vb.sceneBoundingRect())
+            self.view_current.linkedViewChanged(self.plot_V.vb, self.view_current.XAxis)
+        
+        self.plot_V.vb.sigResized.connect(update_views)
+        
+                    # Add graphs to layout
+        self.plots_layout.addWidget(self.graph_widget)
+        
                 # Log Window
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
@@ -690,12 +777,20 @@ class ElectrosprayUI(QMainWindow):
         self.input_filepath.setEnabled(False)
         self.input_sample_rate.setEnabled(False)
         
+        # Clear buffers (for plot)
+        self.data_time.clear()
+        self.data_voltage.clear()
+        self.data_current.clear()
+        self.start_time = time.time()
+        
         # Check if camera is in use
         if "Camera" in self.combo_mode.currentText():
             use_cam = True
-            self.cam_worker.trigger_mode = "Hardware"
+            self.cam_worker.trigger_mode = "Software"
+            self.append_log("Mode: Camera + DAQ") 
         else:
             use_cam = False
+            self.append_log("Mode: DAQ Only (Camera OFF)") 
     
         # Pass settings to workers
             # Cam worker
@@ -818,13 +913,31 @@ class ElectrosprayUI(QMainWindow):
 
     @pyqtSlot(object)
     def update_image_display(self, image_array):
-        # Here you would update a plot/image widget
-        # For now, just print the shape to prove it works
-        pass 
+        # Transpose to fix rotation (Cameras scan differently than screens)
+        display_data = image_array.T
 
+        # AUTO-RANGE LOGIC
+        # If the view is empty (first frame), Force Zoom-to-Fit
+        if self.cam_view.image is None:
+            self.cam_view.setImage(display_data, autoLevels=True, autoRange=True)
+            # Optional: Set a fixed brightness range (e.g. 0 to 200 for dim signals)
+            # self.cam_view.setLevels(0, 255)
+        else:
+            # Afterwards, keep user's zoom/pan
+            self.cam_view.setImage(display_data, autoLevels=False, autoRange=False)
+            
     @pyqtSlot(float, float)
     def update_daq_display(self, volts, amps):
-        self.voltage_placeholder_text.setText(f"Voltage: {volts:.2f} V | Current: {amps:.6f} A")
+        # Update plots
+        t = time.time() - self.start_time
+        self.data_time.append(t)
+        self.data_voltage.append(volts)
+        self.data_current.append(amps)
+        
+        self.curve_V.setData(list(self.data_time), list(self.data_voltage))
+        self.curve_I.setData(list(self.data_time), list(self.data_current))
+        
+        #self.voltage_placeholder_text.setText(f"Voltage: {volts:.2f} V | Current: {amps:.6f} A")
 
 # --- APP ENTRY POINT ---
 if __name__ == "__main__":
