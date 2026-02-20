@@ -109,6 +109,7 @@ class CameraWorker(QThread):
                     self.camera.roi = (TL_x, TL_y, BR_x, BR_y)
             else:
                 self.log_message.emit("Error in setting up ROI (defaulting back to full frame).")
+                self.camera.roi = (0, 0, self.camera.sensor_width_pixels, self.camera.sensor_height_pixels)
             
             # 2. Configure Camera
             self.camera.exposure_time_us = self.exposure_time_us
@@ -187,6 +188,7 @@ class DAQWorker(QThread):
         self.target_voltage = 0.0
         self.polarity_mode = 0
         self.high_time = 1 
+        self.cam_timing_mode = "Continuous"
         
         # Initialise modules
         self.ai_channel_name = "cDAQ9185-2023AF4Mod1"
@@ -208,6 +210,17 @@ class DAQWorker(QThread):
         
     def set_polarity_mode(self, val):
         self.polarity_mode = val
+
+    def set_hightime(self, val):
+        self.high_time = val
+        self.cam_half_way = val / 2.0  # Pre-calculate half-way point
+        
+    def set_fps(self, val):
+        self.cam_fps = val
+        if val > 0:
+            self.cam_trigger_period = 1.0 / val  # Pre-calculate period
+        else:
+            self.cam_trigger_period = 0.1
 
     def run(self):
         self.is_running = True
@@ -279,6 +292,9 @@ class DAQWorker(QThread):
             # --- D. Initialize Timing Variables ---
             last_switch_time = time.time()
             is_high_state = True
+            self.set_fps(self.cam_fps)
+            self.set_hightime(self.high_time)
+            self.cam_pulse_width = 0.02 # pulse width
 
             # --- E. MAIN LOOP ---
             with open(self.filepath, mode='a', newline='') as f:
@@ -319,13 +335,19 @@ class DAQWorker(QThread):
                                 else:
                                     val_to_write = 0.0
                                     self.log_message.emit(f"NO MATCHING POLARITY MODE: {self.polarity_mode}")
+                        
                         elif func == "Camera control":
-                            trigger_period = 0.1 # 100ms
-                            if (now % trigger_period) < (trigger_period / 2):
-                                val_to_write = 5.0 # High (Trigger)
-                            else:
-                                val_to_write = 0.0 # Low (Reset)
-                         
+                            val_to_write = 0.0
+                            
+                            if self.cam_timing_mode == "Continuous":
+                                if (now % self.cam_trigger_period) < (self.cam_trigger_period / 2.0):
+                                    val_to_write = 5.0
+                                elif self.cam_timing_mode == "Mid-cycle":
+                                    time_in_state = now - last_switch_time
+                                    # Check if past half-way in cycle
+                                    if self.cam_half_way <= time_in_state <= (self.cam_half_way + self.cam_pulse_width):
+                                        val_to_write = 5.0
+                                        self.log_message.emit("Photo taken.")
                         
                         #self.log_message.emit(f"AO Voltage: {val_to_write}")
                         ao_data_out.append(val_to_write)
@@ -569,13 +591,18 @@ class menu_camera_settings(QDialog):
         self.layout_gen.addWidget(self.input_fps, this_row, 1)
         
         this_row += 1
+        self.input_timing = QComboBox()
+        self.input_timing.addItems(["Continuous", "Mid-cycle"])
+        self.input_timing.setCurrentText(self.config.get("timing_mode", "Continuous"))
+        self.layout_gen.addWidget(QLabel("Timing mode: "), this_row, 0)
+        self.layout_gen.addWidget(self.input_timing, this_row, 1,)
+        
+        this_row += 1
         self.input_trigger = QComboBox()
         self.input_trigger.addItems(["Software", "Hardware"])
         self.input_trigger.setCurrentText(self.config.get("trigger_mode", "Software"))
         self.layout_gen.addWidget(QLabel("Trigger Mode:"), this_row, 0)
         self.layout_gen.addWidget(self.input_trigger, this_row, 1)
-        
-        #self.input
         
         self.layout_left.addWidget(self.group_gen)
 
@@ -593,18 +620,20 @@ class menu_camera_settings(QDialog):
             # Spin boxes for top left co-ords
         self.spin_TL_x = QSpinBox()
         self.spin_TL_x.setRange(0, 4096)
-        self.spin_TL_x.valueChanged.connect(self.update_roi_from_spinbox)
+        self.spin_TL_x.setValue(self.curr_TL_x)
         self.spin_TL_y = QSpinBox()
         self.spin_TL_y.setRange(0, 3000)
-        self.spin_TL_y.valueChanged.connect(self.update_roi_from_spinbox)
+        self.spin_TL_y.setValue(self.curr_TL_y)
+        
         
             # Spin boxes for bottom right co-ords
         self.spin_BR_x = QSpinBox()
         self.spin_BR_x.setRange(0, 4096)
-        self.spin_BR_x.valueChanged.connect(self.update_roi_from_spinbox)
+        self.spin_BR_x.setValue(self.curr_BR_x)
         self.spin_BR_y = QSpinBox()
         self.spin_BR_y.setRange(0, 3000)
-        self.spin_BR_y.valueChanged.connect(self.update_roi_from_spinbox)
+        self.spin_BR_y.setValue(self.curr_BR_y)
+        
         
             # Reset to full frame button
         self.full_frame_button = QPushButton("Reset to full frame")
@@ -655,6 +684,12 @@ class menu_camera_settings(QDialog):
         self.roi_tool.maxBounds = QRectF(0, 0, 4096, 3000)
         self.cam_view.addItem(self.roi_tool)
         self.roi_tool.sigRegionChangeFinished.connect(self.update_spinbox_from_roi)
+        
+        # Connect spin boxes
+        self.spin_TL_x.valueChanged.connect(self.update_roi_from_spinbox)
+        self.spin_TL_y.valueChanged.connect(self.update_roi_from_spinbox)
+        self.spin_BR_x.valueChanged.connect(self.update_roi_from_spinbox)
+        self.spin_BR_y.valueChanged.connect(self.update_roi_from_spinbox)
 
         self.start_preview()
 
@@ -730,6 +765,7 @@ class menu_camera_settings(QDialog):
 
     def save_and_close(self):
         self.config["fps"] = self.input_fps.value()
+        self.config["timing_mode"] = self.input_timing.currentText()
         self.config["trigger_mode"] = self.input_trigger.currentText()
         self.config["roi_TL_x"] = self.spin_TL_x.value()
         self.config["roi_TL_y"] = self.spin_TL_y.value()
@@ -976,6 +1012,7 @@ class ElectrosprayUI(QMainWindow):
         
         self.cam_config = {
             "fps": float(self.settings.value("cam_fps", 10.0)),
+            "timing_mode": self.settings.value("cam_timing", "Continuous"),
             "trigger_mode": self.settings.value("cam_trigger", "Software"),
             "roi_TL_x" : int(self.settings.value("cam_roi_TL_x", 0)),
             "roi_TL_y" : int(self.settings.value("cam_roi_TL_y", 0)),
@@ -1070,11 +1107,14 @@ class ElectrosprayUI(QMainWindow):
         self.daq_worker.ao_channels_to_use = ao_chans
         self.daq_worker.ao_map = self.hw_config.get("ao_map", {}) 
         self.daq_worker.ai_map = self.hw_config.get("ai_map", {})
+        self.daq_worker.cam_fps = self.cam_config["fps"]
+        self.daq_worker.cam_timing_mode = self.cam_config["timing_mode"]
         
         # Force update to live settings
         self.daq_worker.set_voltage(self.input_voltage.value())
         self.daq_worker.set_hightime(self.input_high_time.value())
         self.daq_worker.set_polarity_mode(self.input_polarity_mode.currentText())
+        self.daq_worker.set_fps(self.cam_config["fps"])
         
         # Start Threads
         if use_cam == True:
