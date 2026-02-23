@@ -175,6 +175,7 @@ class CameraWorker(QThread):
 class DAQWorker(QThread):
     data_ready = pyqtSignal(float, float) # Sends (Voltage, Current)
     log_message = pyqtSignal(str)
+    photo_triggered = pyqtSignal()
     
     def __init__(self):
         super().__init__()
@@ -189,6 +190,8 @@ class DAQWorker(QThread):
         self.polarity_mode = 0
         self.high_time = 1 
         self.cam_timing_mode = "Continuous"
+        self.cam_fps = 0    
+        self.use_camera = True
         
         # Initialise modules
         self.ai_channel_name = "cDAQ9185-2023AF4Mod1"
@@ -295,6 +298,7 @@ class DAQWorker(QThread):
             self.set_fps(self.cam_fps)
             self.set_hightime(self.high_time)
             self.cam_pulse_width = 0.02 # pulse width
+            self.mid_cycle_flag = False
 
             # --- E. MAIN LOOP ---
             with open(self.filepath, mode='a', newline='') as f:
@@ -313,8 +317,10 @@ class DAQWorker(QThread):
                         if (now - last_switch_time) >= self.high_time:
                             is_high_state = not is_high_state # toggle state
                             last_switch_time = now
+                            self.mid_cycle_flag = False
                     else:
                         is_high_state = True # Always "high" if constant
+                        self.mid_cycle_flag = True
                         
                     ao_data_out = []
                     
@@ -339,15 +345,19 @@ class DAQWorker(QThread):
                         elif func == "Camera control":
                             val_to_write = 0.0
                             
-                            if self.cam_timing_mode == "Continuous":
-                                if (now % self.cam_trigger_period) < (self.cam_trigger_period / 2.0):
-                                    val_to_write = 5.0
-                                elif self.cam_timing_mode == "Mid-cycle":
-                                    time_in_state = now - last_switch_time
-                                    # Check if past half-way in cycle
-                                    if self.cam_half_way <= time_in_state <= (self.cam_half_way + self.cam_pulse_width):
+                            if self.use_camera:
+                                if self.cam_timing_mode == "Continuous":
+                                    if (now % self.cam_trigger_period) < (self.cam_trigger_period / 2.0):
                                         val_to_write = 5.0
-                                        self.log_message.emit("Photo taken.")
+                                    elif self.cam_timing_mode == "Mid-cycle":
+                                        time_in_state = now - last_switch_time
+                                        # Check if past half-way in cycle
+                                        if self.cam_half_way <= time_in_state <= (self.cam_half_way + self.cam_pulse_width):
+                                            val_to_write = 5.0
+                            
+                                if not self.mid_cycle_flag:
+                                    self.photo_triggered.emit()
+                                    self.mid_cycle_flag = True
                         
                         #self.log_message.emit(f"AO Voltage: {val_to_write}")
                         ao_data_out.append(val_to_write)
@@ -589,6 +599,13 @@ class menu_camera_settings(QDialog):
         self.input_fps.setValue(float(self.config.get("fps", 10.0)))
         self.layout_gen.addWidget(QLabel("Target FPS:"), this_row, 0)
         self.layout_gen.addWidget(self.input_fps, this_row, 1)
+        
+        """
+        this_row += 1
+        self.input_exposure = QDoubleSpinBox()
+        self.input_exposure.setMinimum(0)
+        self.input_exposure.setValue(float(self.config.get("exposure", )))
+        """
         
         this_row += 1
         self.input_timing = QComboBox()
@@ -903,7 +920,7 @@ class ElectrosprayUI(QMainWindow):
         # Row 3: Live feeds (Camera Feed | Plot Feed)
         self.feeds_layout = QHBoxLayout()
         
-            # LEFT: Camera Feed (placeholder)
+            # LEFT: Camera Feed
         self.group_cam_feed = QGroupBox("Camera Feed")
         self.cam_feed_layout = QVBoxLayout()
         self.group_cam_feed.setLayout(self.cam_feed_layout)
@@ -958,6 +975,13 @@ class ElectrosprayUI(QMainWindow):
         self.view_current.addItem(self.curve_I)
         self.legend.addItem(self.curve_I, "Collector current")
         
+                    # Plot 3 - Photo triggers
+        self.trigger_scatter = pg.ScatterPlotItem(size = 10, pen = pg.mkPen(None), brush=pg.mkBrush(255, 0, 0, 200))
+        self.plot_V.addItem(self.trigger_scatter)
+        self.trigger_points_x = deque(maxlen=self.plot_max_points)
+        self.trigger_points_y = deque(maxlen=self.plot_max_points)
+        
+        
         def update_views():
             # Function to update the view box to match the first (voltage)
             self.view_current.setGeometry(self.plot_V.vb.sceneBoundingRect())
@@ -988,6 +1012,7 @@ class ElectrosprayUI(QMainWindow):
         self.cam_worker.image_ready.connect(self.update_image_display) # You need to write this function
         self.daq_worker.data_ready.connect(self.update_daq_display)
         self.daq_worker.log_message.connect(self.append_log)
+        self.daq_worker.photo_triggered.connect(self.mark_photo_on_graph)
 
 
         # Recall previous settings values
@@ -1049,6 +1074,9 @@ class ElectrosprayUI(QMainWindow):
         self.data_time.clear()
         self.data_voltage.clear()
         self.data_current.clear()
+        self.trigger_points_x.clear()
+        self.trigger_points_y.clear()
+        self.trigger_scatter.setData([], [])
         self.start_time = time.time()
         
         # Check if camera is in use
@@ -1056,9 +1084,12 @@ class ElectrosprayUI(QMainWindow):
             use_cam = True
             self.cam_worker.trigger_mode = "Hardware"
             self.append_log("Mode: Camera + DAQ") 
+            self.legend.addItem(self.trigger_scatter, "Image taken")
         else:
             use_cam = False
             self.append_log("Mode: DAQ Only (Camera OFF)") 
+            
+        self.daq_worker.use_camera = use_cam
     
         # Pass settings to workers
             # Cam worker
@@ -1246,6 +1277,17 @@ class ElectrosprayUI(QMainWindow):
         self.curve_I.setData(list(self.data_time), list(self.data_current))
         
         #self.voltage_placeholder_text.setText(f"Voltage: {volts:.2f} V | Current: {amps:.6f} A")
+
+    @pyqtSlot()
+    def mark_photo_on_graph(self):
+        # Only mark it if we have valid voltage data
+        if len(self.data_time) > 0:
+            current_t = self.data_time[-1]
+            current_v = self.data_voltage[-1]
+            
+            self.trigger_points_x.append(current_t)
+            self.trigger_points_y.append(current_v)
+            self.trigger_scatter.setData(list(self.trigger_points_x), list(self.trigger_points_y))
 
 # --- APP ENTRY POINT ---
 if __name__ == "__main__":
