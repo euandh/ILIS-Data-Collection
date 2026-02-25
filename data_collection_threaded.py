@@ -41,7 +41,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QComboBox, QLineEdit,
                              QDoubleSpinBox, QSpinBox, QTextEdit, QFileDialog,
                              QGroupBox, QGridLayout, QDialog, QFormLayout,
-                             QDialogButtonBox)
+                             QDialogButtonBox, QCheckBox)
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, Qt, QSettings, QRectF
 from PyQt6.QtGui import QIcon
 import pyqtgraph as pg
@@ -192,6 +192,12 @@ class DAQWorker(QThread):
         self.cam_timing_mode = "Continuous"
         self.cam_fps = 0    
         self.use_camera = True
+        self.smooth_display = True
+        self.gain = 1E+6
+
+        # Averaging/taring variables
+        self.voltage_zero_offset = 0.0
+        self.request_tare = False
         
         # Initialise modules
         self.ai_channel_name = "cDAQ9185-2023AF4Mod1"
@@ -217,6 +223,9 @@ class DAQWorker(QThread):
     def set_hightime(self, val):
         self.high_time = val
         self.cam_half_way = val / 2.0  # Pre-calculate half-way point
+        
+    def set_gain(self, val):
+        self.gain = val
         
     def set_fps(self, val):
         self.cam_fps = val
@@ -286,6 +295,9 @@ class DAQWorker(QThread):
             self.log_message.emit(f"AO Configured: {self.ao_ordered_functions}")
 
             # --- C. Initialize CSV ---
+            csv_headers.append("Active Tare Offset (V)")
+            csv_headers.append("Gain (V/A)")
+            
             # Create file with the dynamic headers
             with open(self.filepath, mode='w', newline='') as f:
                 csv.writer(f).writerow(csv_headers)
@@ -299,6 +311,15 @@ class DAQWorker(QThread):
             self.set_hightime(self.high_time)
             self.cam_pulse_width = 0.02 # pulse width
             self.mid_cycle_flag = False
+            
+            # Aveaging window for taring
+            tare_window_size = max(1, int(10 / self.sample_rate))   # 10s taring window
+            self.tare_buffer = deque(maxlen=tare_window_size)
+            
+            # Averaging window for plot smoothing
+            plot_window_size = max(1, int(0.2 / self.sample_rate))
+            self.volts_history = deque(maxlen = plot_window_size)
+            self.amps_history = deque(maxlen = plot_window_size)
 
             # --- E. MAIN LOOP ---
             with open(self.filepath, mode='a', newline='') as f:
@@ -330,17 +351,17 @@ class DAQWorker(QThread):
                         if func == "Matsusada control":
                             # Apply positive voltage if in high state
                             if is_high_state:
-                                val_to_write = self.target_voltage/1000 # Convert to scaled control voltage
+                                val_to_write = self.target_voltage/500 # Convert to scaled control voltage
                             else:
                                 # Apply the negative voltage if in low state in bipolar
                                 if self.polarity_mode == "Bipolar switching":
-                                    val_to_write = -1 * self.target_voltage/1000
+                                    val_to_write = -1 * self.target_voltage/500
                                 # Apply zero if in unipolar switching
                                 elif self.polarity_mode == "Unipolar switching":
                                     val_to_write = 0.0
                                 else:
                                     val_to_write = 0.0
-                                    self.log_message.emit(f"NO MATCHING POLARITY MODE: {self.polarity_mode}")
+                                    self.log_message.emit(f"NO MATCHING POLARITY MODE: {self.polarity_mode}")                        
                         
                         elif func == "Camera control":
                             val_to_write = 0.0
@@ -386,7 +407,7 @@ class DAQWorker(QThread):
                     # --------------------------------------
                     
                     # Construct CSV Row: Timestamp + Inputs + Outputs
-                    row_data = [datetime.datetime.now()] + ai_data_in + ao_data_out
+                    row_data = [datetime.datetime.now()] + ai_data_in + ao_data_out + [self.voltage_zero_offset] + [self.gain]
                     writer.writerow(row_data)
                     
                     # Update GUI Display
@@ -397,13 +418,43 @@ class DAQWorker(QThread):
                     
                     for i, func in enumerate(self.ai_ordered_functions):
                         if func == "Matsusada read in":
-                            # Convert 5V back to 5000V for display
-                            display_volts = ai_data_in[i] * 1000 
-                        elif "current" in func.lower():
+                            raw_v = ai_data_in[i]
+                            
+                            self.tare_buffer.append(raw_v)
+                            
+                            # Tare
+                            if self.request_tare:
+                                if len(self.tare_buffer) > 0:
+                                    self.voltage_zero_offset = sum(self.tare_buffer) / len(self.tare_buffer)
+                                else:
+                                    self.voltage_zero_offset = raw_v # Failsafe
+                                    
+                                self.request_tare = False
+                                
+                                if self.target_voltage != 0:
+                                    self.log_message.emit(f"WARNING: Taring at non-zero voltage output ({self.target_voltage}). This will not correct for a zero-error.")
+                            
+                            # Calculate the active display voltage using the locked offset
+                            display_volts = (raw_v - self.voltage_zero_offset) * 500.0
+                            
+                        elif func == "Current collector (FEMTO)":
+                            display_current = ai_data_in[i]/self.gain
+                            self.log_message.emit(f"GAIN: {self.gain}")
+                        elif func == "Extractor current" or func == "Emitter current (keysight)":
                             display_current = ai_data_in[i]
 
-                    # Emit signal to GUI
-                    self.data_ready.emit(display_volts, display_current)
+                    # Emit signal to GUI after averaging
+                    self.volts_history.append(display_volts)
+                    self.amps_history.append(display_current)
+                    
+                    if self.smooth_display:
+                        emit_v = np.average(self.volts_history)
+                        emit_i = np.average(self.amps_history)
+                    else:
+                        emit_v = display_volts
+                        emit_i = display_current
+                        
+                    self.data_ready.emit(emit_v, emit_i)
                     
                     # Pace the loop
                     time.sleep(self.sample_rate)
@@ -469,7 +520,7 @@ class HardwareConfigDialog(QDialog):
         self.layout_AI.addWidget(self.input_device_ai, 0, 1)
 
                     # Channel Dropdowns
-        self.AI_options = ["None", "Matsusada read in", "Current collector", "Extractor current"]
+        self.AI_options = ["None", "Matsusada read in", "Current collector (FEMTO)", "Extractor current", "Emitter current (keysight)"]
                     # Store these in a list so we can access them easily later
         self.ai_combos = []
         
@@ -900,6 +951,22 @@ class ElectrosprayUI(QMainWindow):
         self.input_polarity_mode = QComboBox()
         self.input_polarity_mode.addItems(["Bipolar switching", "Unipolar switching", "Unipolar constant"])
         self.input_polarity_mode.currentIndexChanged.connect(self.update_DAQ_polarity_mode)
+                # Gain
+        self.input_gain = QComboBox()
+        self.input_gain.addItem("10²", 1E+2)  
+        self.input_gain.addItem("10³", 1E+3)
+        self.input_gain.addItem("10⁴", 1E+4)
+        self.input_gain.addItem("10⁵", 1E+5)
+        self.input_gain.addItem("10⁶", 1E+6)
+        self.input_gain.addItem("10⁷", 1E+7)
+        #connect code here
+                # Tare
+        self.input_tare = QPushButton("Tare voltage reading")
+        self.input_tare.clicked.connect(self.tare_voltage)
+                # Plot smoothing
+        self.input_check_smooth = QCheckBox("Smooth live plot")
+        self.input_check_smooth.setChecked(True)
+        self.input_check_smooth.stateChanged.connect(self.update_DAQ_smoothing)
 
                 # Add all widgets
         self.live_set_layout.addWidget(QLabel("Emitter voltage: "), 0, 0)
@@ -910,6 +977,12 @@ class ElectrosprayUI(QMainWindow):
         
         self.live_set_layout.addWidget(QLabel("Polarity mode:"), 2, 0)
         self.live_set_layout.addWidget(self.input_polarity_mode, 2, 1)
+        
+        self.live_set_layout.addWidget(QLabel("FEMTO Gain"), 3, 0)
+        self.live_set_layout.addWidget(self.input_gain, 3, 1)
+        
+        self.live_set_layout.addWidget(self.input_tare, 4, 0)
+        self.live_set_layout.addWidget(self.input_check_smooth, 4, 1)
         
             # MAKE WHOLE ROW: Add both groups to the layout
         self.settings_layout.addWidget(self.group_static_settings, 1)
@@ -1014,7 +1087,6 @@ class ElectrosprayUI(QMainWindow):
         self.daq_worker.log_message.connect(self.append_log)
         self.daq_worker.photo_triggered.connect(self.mark_photo_on_graph)
 
-
         # Recall previous settings values
         self.settings = QSettings("config.ini", QSettings.Format.IniFormat)
         
@@ -1025,6 +1097,7 @@ class ElectrosprayUI(QMainWindow):
         self.input_voltage.setValue(float(self.settings.value("voltage", 0.0)))
         self.input_high_time.setValue(float(self.settings.value("high_time", 1.0)))
         self.input_polarity_mode.setCurrentIndex(int(self.settings.value("polarity_idx", 0)))
+        self.input_gain.setCurrentText(self.settings.value("gain", "10⁶"))
         
         self.hw_config = {
             "ai_device": self.settings.value("ai_device", "cDAQ9185-2023AF4Mod1"),
@@ -1079,6 +1152,8 @@ class ElectrosprayUI(QMainWindow):
         self.trigger_scatter.setData([], [])
         self.start_time = time.time()
         
+        self.legend.removeItem(self.trigger_scatter) # Remove image taken plotting by default
+        
         # Check if camera is in use
         if "Camera" in self.combo_mode.currentText():
             use_cam = True
@@ -1088,6 +1163,7 @@ class ElectrosprayUI(QMainWindow):
         else:
             use_cam = False
             self.append_log("Mode: DAQ Only (Camera OFF)") 
+            
             
         self.daq_worker.use_camera = use_cam
     
@@ -1146,6 +1222,9 @@ class ElectrosprayUI(QMainWindow):
         self.daq_worker.set_hightime(self.input_high_time.value())
         self.daq_worker.set_polarity_mode(self.input_polarity_mode.currentText())
         self.daq_worker.set_fps(self.cam_config["fps"])
+        self.daq_worker.sample_rate = self.input_sample_rate.value()/1000
+        self.daq_worker.smooth_display = self.input_check_smooth.isChecked()
+        self.daq_worker.gain = self.input_gain.currentData()
         
         # Start Threads
         if use_cam == True:
@@ -1288,6 +1367,23 @@ class ElectrosprayUI(QMainWindow):
             self.trigger_points_x.append(current_t)
             self.trigger_points_y.append(current_v)
             self.trigger_scatter.setData(list(self.trigger_points_x), list(self.trigger_points_y))
+
+    @pyqtSlot()
+    def tare_voltage(self):
+        # Tares the voltage from the AI, but can only do so if we're already running.
+        if self.daq_worker.isRunning():
+            self.daq_worker.request_tare = True
+            self.append_log(f"Voltage display tared to 0 V.")
+        else:
+            self.append_log("Cannot tare: Start the acquisition first so the DAQ can read the baseline!")
+
+    @pyqtSlot()
+    def update_gain(self):
+        self.daq_worker.gain = self.input_gain.currentData()
+
+    @pyqtSlot()
+    def update_DAQ_smoothing(self):
+        self.daq_worker.smooth_display = self.input_check_smooth.isChecked()
 
 # --- APP ENTRY POINT ---
 if __name__ == "__main__":
