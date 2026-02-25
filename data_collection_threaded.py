@@ -62,6 +62,10 @@ from thorlabs_tsi_sdk.tl_mono_to_color_processor import MonoToColorProcessorSDK
 from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
 import imagecodecs
 
+# Serial and VISA libraries for talking to the Keysight
+import pyvisa
+import serial.tools.list_ports
+
 # --- WORKER THREAD 1: CAMERA CONTROL ---
 class CameraWorker(QThread):
     image_ready = pyqtSignal(object)  # Sends numpy array
@@ -184,6 +188,7 @@ class DAQWorker(QThread):
         # Initialise set-up variables
         self.filepath = "data.csv"
         self.sample_rate = 4e-3 
+        self.latest_ks_value = 0.0
         
         # Initialise control variables
         self.target_voltage = 0.0
@@ -233,6 +238,9 @@ class DAQWorker(QThread):
             self.cam_trigger_period = 1.0 / val  # Pre-calculate period
         else:
             self.cam_trigger_period = 0.1
+
+    def update_ks_value(self, val):
+        self.latest_ks_value = val
 
     def run(self):
         self.is_running = True
@@ -297,6 +305,7 @@ class DAQWorker(QThread):
             # --- C. Initialize CSV ---
             csv_headers.append("Active Tare Offset (V)")
             csv_headers.append("Gain (V/A)")
+            csv_headers.append("Emitter current (Keysight)")
             
             # Create file with the dynamic headers
             with open(self.filepath, mode='w', newline='') as f:
@@ -407,7 +416,7 @@ class DAQWorker(QThread):
                     # --------------------------------------
                     
                     # Construct CSV Row: Timestamp + Inputs + Outputs
-                    row_data = [datetime.datetime.now()] + ai_data_in + ao_data_out + [self.voltage_zero_offset] + [self.gain]
+                    row_data = [datetime.datetime.now()] + ai_data_in + ao_data_out + [self.voltage_zero_offset] + [self.gain] + [self.latest_ks_value]
                     writer.writerow(row_data)
                     
                     # Update GUI Display
@@ -439,7 +448,6 @@ class DAQWorker(QThread):
                             
                         elif func == "Current collector (FEMTO)":
                             display_current = ai_data_in[i]/self.gain
-                            self.log_message.emit(f"GAIN: {self.gain}")
                         elif func == "Extractor current" or func == "Emitter current (keysight)":
                             display_current = ai_data_in[i]
 
@@ -482,6 +490,80 @@ class DAQWorker(QThread):
                 
             self.log_message.emit("DAQ resources released.")
 
+    def stop(self):
+        self.is_running = False
+        self.wait()
+
+class KeysightWorker(QThread):
+    ks_reading = pyqtSignal(float)
+    log_message = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.is_running = False
+        self.port = "ASRL11::INSTR"
+        
+    def run(self):
+        self.is_running = True
+        
+        # FIND THE MULTIMETER
+        
+        # Try and look through descriptions
+        self.all_ports = serial.tools.list_ports.comports()
+        self.possible_ports = []
+        
+        for port in self.all_ports:
+            if "Prolific" in port.description:
+                self.possible_ports.append(port)        
+            
+        # Double check against reported identity using VISA.
+        self.rm = pyvisa.ResourceManager('@py')
+        for port in self.possible_ports:
+            try:
+                self.ks = self.rm.open_resource(port)
+                
+                # Keysight settings
+                self.ks.baud_rate = 9600           # Standard for Keysight IR-to-USB
+                self.ks.read_termination = '\n'  
+                self.ks.write_termination = '\n'   
+                self.ks.timeout = 500            
+                time.sleep(0.5) 
+            
+                ident = self.ks.query("*IDN?")
+                print(ident)
+            
+                if "Keysight" in ident:
+                    self.ks.close()
+                    self.port = port
+        
+                self.ks.close()
+                
+            except:
+                pass
+            
+            finally:
+                if hasattr(self, 'ks'):
+                    self.ks.close()
+
+        # CONNECT TO DESIRED DEVICE
+        self.ks = self.rm.open_resource(self.port)
+        self.ks.baud_rate = 9600           # Standard for Keysight IR-to-USB
+        self.ks.read_termination = '\n'  
+        self.ks.write_termination = '\n'   
+        self.ks.timeout = 500            
+        time.sleep(0.5)
+
+        # READ FROM THE MULTIMETER
+        while self.is_running:
+            try:    
+                self.ks_reading.emit(float(self.ks.query("FETC?")))
+            except:
+                pass
+            time.sleep(0.5)     # I need to add this as a setting later!
+            
+        # CLOSE CONNECTION AFTER LOOP
+        self.ks.close()
+        
     def stop(self):
         self.is_running = False
         self.wait()
@@ -1079,6 +1161,7 @@ class ElectrosprayUI(QMainWindow):
         # Initialize Workers
         self.cam_worker = CameraWorker()
         self.daq_worker = DAQWorker()
+        self.ks_worker = KeysightWorker()
 
         # Connect Signals (Worker -> GUI)
         self.cam_worker.log_message.connect(self.append_log)
@@ -1086,6 +1169,9 @@ class ElectrosprayUI(QMainWindow):
         self.daq_worker.data_ready.connect(self.update_daq_display)
         self.daq_worker.log_message.connect(self.append_log)
         self.daq_worker.photo_triggered.connect(self.mark_photo_on_graph)
+        self.ks_worker.log_message.connect(self.append_log)
+        self.ks_worker.ks_reading.connect(self.daq_worker.update_ks_value)
+
 
         # Recall previous settings values
         self.settings = QSettings("config.ini", QSettings.Format.IniFormat)
@@ -1230,6 +1316,7 @@ class ElectrosprayUI(QMainWindow):
         if use_cam == True:
             self.cam_worker.start()
         self.daq_worker.start()
+        self.ks_worker.start()
         
             
     def closeEvent(self, event):
@@ -1238,7 +1325,7 @@ class ElectrosprayUI(QMainWindow):
         """
         
         # Safety Check: Is the experiment still running?
-        if self.daq_worker.is_running or self.cam_worker.is_running:
+        if self.daq_worker.is_running or self.cam_worker.is_running or self.ks_worker.is_running:
             self.stop_system() # Force a safe shutdown of hardware
             time.sleep(0.5)    # Give threads a tiny moment to close file handles
             
@@ -1318,6 +1405,7 @@ class ElectrosprayUI(QMainWindow):
         self.append_log("Stopping...")
         self.cam_worker.stop()
         self.daq_worker.stop()
+        self.ks_worker.stop()
         
         # unlock inputs
         self.input_sample_rate.setEnabled(True)
