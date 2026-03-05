@@ -155,7 +155,7 @@ class CameraWorker(QThread):
                     # Saving logic...
                     if self.filepath:
                         # tifffile handles the shape automatically
-                        tifffile.imwrite(self.filepath, final_image, append=True)
+                        tifffile.imwrite(self.filepath, final_image, append=True, bigtiff = True)
 
                     if self.trigger_mode == "Software":
                         self.camera.issue_software_trigger()
@@ -602,7 +602,7 @@ class HardwareConfigDialog(QDialog):
         self.layout_AI.addWidget(self.input_device_ai, 0, 1)
 
                     # Channel Dropdowns
-        self.AI_options = ["None", "Matsusada read in", "Current collector (FEMTO)", "Extractor current", "Emitter current (keysight)"]
+        self.AI_options = ["None", "Matsusada read in", "Current collector (FEMTO)", "Extractor current", "Keysight reading"]
                     # Store these in a list so we can access them easily later
         self.ai_combos = []
         
@@ -1442,6 +1442,20 @@ class ElectrosprayUI(QMainWindow):
         
         self.curve_V.setData(list(self.data_time), list(self.data_voltage))
         self.curve_I.setData(list(self.data_time), list(self.data_current))
+        
+        if len(self.data_time) > 0:
+            oldest_visible_time = self.data_time[0]
+            markers_changed = False
+            
+            # Get rid of old photo dots
+            while len(self.trigger_points_x) > 0 and self.trigger_points_x[0] < oldest_visible_time:
+                self.trigger_points_x.popleft()
+                self.trigger_points_y.popleft()
+                markers_changed = True
+                
+            # If we deleted a dot, refresh the scatter plot to clear it from the screen
+            if markers_changed:
+                self.trigger_scatter.setData(list(self.trigger_points_x), list(self.trigger_points_y))
         
         #self.voltage_placeholder_text.setText(f"Voltage: {volts:.2f} V | Current: {amps:.6f} A")
 
