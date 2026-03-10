@@ -21,7 +21,7 @@ def tiff_to_h5(input_fp, output_fp):
         h,w = frame_0.shape
         data_type = frame_0.dtype
         
-        print(f"File has {num_frames} frames, each {w}x{h} px.\nCompressing now to HDF5 at {output_fp}")
+        print(f"File has {num_frames} frames, each {w}x{h} px./nCompressing now to HDF5 at {output_fp}")
         
         with h5py.File(output_fp, 'w') as h5_out:
             dataset = h5_out.create_dataset(
@@ -40,6 +40,6 @@ def tiff_to_h5(input_fp, output_fp):
                 
     print("Conversion complete.")
                 
-input_fp = "C:/Users/edh1g18/localfiles/test files/ESPRAY_2026-03-05_1139_IMAGES.tiff"
-output_fp ="C:/Users/edh1g18/localfiles/test files/ESPRAY_2026-03-05_1139_IMAGES_COMPRESSED_2.h5"
+input_fp = "C:/Users/edh1g18/localfiles/test files/ESPRAY_2026-03-10_1546_IMAGES.tiff"
+output_fp ="C:/Users/edh1g18/localfiles/test files/ESPRAY_2026-03-10_1546_IMAGES_COMPRESSED.h5"
 tiff_to_h5(input_fp, output_fp)

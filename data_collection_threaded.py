@@ -284,7 +284,8 @@ class DAQWorker(QThread):
                 # Add physical channel
                 self.ai_task.ai_channels.add_ai_voltage_chan(
                     f"{self.ai_channel_name}/ai{chan_idx}", 
-                    min_val=self.ai_lims[0], max_val=self.ai_lims[1]
+                    min_val=self.ai_lims[0], max_val=self.ai_lims[1],
+                    terminal_config = constants.TerminalConfiguration.RSE
                 )
                 
                 # Identify function (e.g. "Matsusada read in")

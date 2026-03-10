@@ -2,33 +2,37 @@ int trigPin = 3;
 int NI_pin_control = A0;
 int FVALPin = 5;
 int NI_pin_FVAL = 8;
-bool lastControlState = false;
 
 void setup() {
+    Serial.begin(9600); 
+    
     pinMode(trigPin, OUTPUT);
-    digitalWrite(trigPin, LOW);   
+    digitalWrite(trigPin, LOW);
+    
     pinMode(NI_pin_control, INPUT);
     
-    pinMode(FVALPin, INPUT);
+    // Use INPUT_PULLUP just in case the camera uses an open-drain output
+    pinMode(FVALPin, INPUT_PULLUP); 
+    
     pinMode(NI_pin_FVAL, OUTPUT);
     digitalWrite(NI_pin_FVAL, LOW);
 }
 
 void loop() {
-    bool currentControlState = analogRead(NI_pin_control) > 102;
+    // Read the DAQ Control Pulse
+    bool daq_pulse_active = analogRead(NI_pin_control) > 102;
     
-    // Only trigger on the rising edge of the control signal
-    if (currentControlState && !lastControlState) {
-        digitalWrite(trigPin, HIGH);  // Rising edge pulse
-        delay(10);
+    // Instantly mirror the DAQ pulse to the Camera
+    if (daq_pulse_active) {
+        digitalWrite(trigPin, HIGH);
+    } else {
         digitalWrite(trigPin, LOW);
     }
-    lastControlState = currentControlState;
 
-    // Leave FVAL high long enough for NI DAQ to sample it
+    // Send FVAL back to the DAQ
     if (digitalRead(FVALPin) == HIGH) {
         digitalWrite(NI_pin_FVAL, HIGH);
-        delay(200);
+    } else {
         digitalWrite(NI_pin_FVAL, LOW);
     }
 }
