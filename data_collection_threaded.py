@@ -373,6 +373,8 @@ class DAQWorker(QThread):
                 
                 if self.ai_channels_to_use:
                     self.ai_task.start()
+                    self.experiment_start_time = datetime.datetime.now()
+                    self.total_samples_read = 0
                 
                 while self.is_running:
                     now = time.time()
@@ -480,20 +482,21 @@ class DAQWorker(QThread):
                     rows_to_write = []
                     photo_just_taken = False
                     
-                    # Calculate perfect microsecond timestamps for this chunk
-                    chunk_end_time = datetime.datetime.now()
+                    # Calculate the physical time between each sample
                     time_step = datetime.timedelta(seconds=(1.0 / self.hardware_rate_hz))
-                    chunk_start_time = chunk_end_time - (num_samples * time_step)
                     
                     # Variables to hold the final value of the chunk for the GUI
                     display_volts = 0.0
                     display_current = 0.0
 
-                    # Process every single reading the DAQ took while Python was busy
+                    # Process every single reading the DAQ took
                     for sample_idx in range(num_samples):
                         # Extract the row for this specific point in time
                         ai_data_in = [chan[sample_idx] for chan in raw_ai_chunk]
-                        sample_timestamp = chunk_start_time + (sample_idx * time_step)
+                        
+                        # Anchored timestep
+                        current_sample_number = self.total_samples_read + sample_idx
+                        sample_timestamp = self.experiment_start_time + (current_sample_number * time_step)
                         
                         for i, func in enumerate(self.ai_ordered_functions):
                             if func == "Matsusada read in":
@@ -529,8 +532,11 @@ class DAQWorker(QThread):
                         row_data = [sample_timestamp] + ai_data_in + ao_data_out + [self.voltage_zero_offset] + [self.gain] + [self.latest_ks_value] + [self.current_frame_id]
                         rows_to_write.append(row_data)
 
+                    # Update the global counter for the next chunk ---
+                    self.total_samples_read += num_samples
+
                     # Write the entire high-speed chunk to the file at once
-                    writer.writerows(rows_to_write) 
+                    writer.writerows(rows_to_write)
 
                     # Update the GUI with just the latest values from the chunk to save CPU
                     self.volts_history.append(display_volts)
