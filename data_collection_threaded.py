@@ -59,7 +59,7 @@ import windows_setup   # This is Thorlabs windows set-up code
 import tifffile
 from thorlabs_tsi_sdk.tl_camera import TLCameraSDK
 from thorlabs_tsi_sdk.tl_mono_to_color_processor import MonoToColorProcessorSDK
-from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE
+from thorlabs_tsi_sdk.tl_camera_enums import SENSOR_TYPE, OPERATION_MODE, TRIGGER_POLARITY
 import imagecodecs
 
 # Serial and VISA libraries for talking to the Keysight
@@ -86,7 +86,7 @@ class CameraWorker(QThread):
     def run(self):
         self.is_running = True
         self.log_message.emit("Camera: Initializing SDK...")
-        
+
         try:
             # 1. Initialize SDK & Camera
             self.DLL_dr = "C:\Program Files\Thorlabs\Scientific Imaging\ThorCam"
@@ -120,15 +120,26 @@ class CameraWorker(QThread):
             self.camera.image_poll_timeout_ms = 1000 # Wait 1s for a frame
             
             if self.trigger_mode == "Hardware":
-                self.camera.operation_mode = 1
+                self.camera.operation_mode = OPERATION_MODE.HARDWARE_TRIGGERED
                 self.camera.frames_per_trigger_zero_for_unlimited = 1
+                self.camera.trigger_polarity = TRIGGER_POLARITY.ACTIVE_HIGH
+                print("In hardware mode")
             else:
                 self.camera.operation_mode = 0
                 self.camera.frames_per_trigger_zero_for_unlimited = 0
+                self.camera.trigger_polarity = TRIGGER_POLARITY.ACTIVE_HIGH
+                print("Not in hardware mode")
             
             self.camera.arm(2) # 2 frames buffer
+
+            # Enable EEP to get a signal during actual exposure, not readout
+            if self.camera.is_eep_supported:
+                self.camera.is_eep_enabled = True
+                self.log_message.emit("EEP mode enabled - signal active during exposure")
+            else:
+                self.log_message.emit("WARNING: EEP not supported on this camera, falling back to FVAL")
             
-            self.log_message.emit(f"Camera: Armed ({self.camera.name} in {self.trigger_mode} mode.)")
+            self.log_message.emit(f"Camera arming in {self.trigger_mode} mode, frames_per_trigger={self.camera.frames_per_trigger_zero_for_unlimited}")
 
             # 3. Continuous Loop
             # Trigger first frame if in Software mode
@@ -204,6 +215,11 @@ class DAQWorker(QThread):
         self.voltage_zero_offset = 0.0
         self.request_tare = False
         
+        # Camera sync variables
+        self.current_frame_id = 0
+        self.last_fval_state = False
+        self.last_cam_trigger_time = 0
+        
         # Initialise modules
         self.ai_channel_name = "cDAQ9185-2023AF4Mod1"
         self.ao_channel_name = "cDAQ9185-2023AF4Mod2"
@@ -218,9 +234,6 @@ class DAQWorker(QThread):
 
     def set_voltage(self, val):
         self.target_voltage = val
-        
-    def set_hightime(self, val):
-        self.high_time = val
         
     def set_polarity_mode(self, val):
         self.polarity_mode = val
@@ -306,6 +319,7 @@ class DAQWorker(QThread):
             csv_headers.append("Active Tare Offset (V)")
             csv_headers.append("Gain (V/A)")
             csv_headers.append("Emitter current (Keysight)")
+            csv_headers.append("Frame ID")
             
             # Create file with the dynamic headers
             with open(self.filepath, mode='w', newline='') as f:
@@ -320,6 +334,7 @@ class DAQWorker(QThread):
             self.set_hightime(self.high_time)
             self.cam_pulse_width = 0.02 # pulse width
             self.mid_cycle_flag = False
+            self.cam_pulse_counter = 0
             
             # Aveaging window for taring
             tare_window_size = max(1, int(10 / self.sample_rate))   # 10s taring window
@@ -377,19 +392,22 @@ class DAQWorker(QThread):
                             
                             if self.use_camera:
                                 if self.cam_timing_mode == "Continuous":
-                                    if (now % self.cam_trigger_period) < (self.cam_trigger_period / 2.0):
+                                    if (now - self.last_cam_trigger_time) >= self.cam_trigger_period:
                                         val_to_write = 5.0
-                                    elif self.cam_timing_mode == "Mid-cycle":
-                                        time_in_state = now - last_switch_time
-                                        # Check if past half-way in cycle
-                                        if self.cam_half_way <= time_in_state <= (self.cam_half_way + self.cam_pulse_width):
-                                            val_to_write = 5.0
+                                        self.last_cam_trigger_time = now
+                                elif self.cam_timing_mode == "Mid-cycle":
+                                    time_in_state = now - last_switch_time
+                                    
+                                    if time_in_state >= self.cam_half_way and not self.mid_cycle_flag:
+                                        self.mid_cycle_flag = True
+                                        self.cam_pulse_counter = 3  # Hold high for 3 loop iterations (~480ms)
+                                    
+                                    if self.cam_pulse_counter > 0:
+                                        val_to_write = 5.0
+                                        self.cam_pulse_counter -= 1
+                                    else:
+                                        val_to_write = 0.0
                             
-                                if not self.mid_cycle_flag:
-                                    self.photo_triggered.emit()
-                                    self.mid_cycle_flag = True
-                        
-                        #self.log_message.emit(f"AO Voltage: {val_to_write}")
                         ao_data_out.append(val_to_write)
 
                     # WRITE AO (if channels exist)
@@ -415,20 +433,16 @@ class DAQWorker(QThread):
                     # 3. LOGGING & UPDATE
                     # --------------------------------------
                     
-                    # Construct CSV Row: Timestamp + Inputs + Outputs
-                    row_data = [datetime.datetime.now()] + ai_data_in + ao_data_out + [self.voltage_zero_offset] + [self.gain] + [self.latest_ks_value]
-                    writer.writerow(row_data)
-                    
                     # Update GUI Display
                     # We need to find the "Meaningful" values to send to the UI
                     # (e.g. Find which channel is Voltage and which is Current)
                     display_volts = 0.0
                     display_current = 0.0
+                    photo_just_taken = False
                     
                     for i, func in enumerate(self.ai_ordered_functions):
                         if func == "Matsusada read in":
                             raw_v = ai_data_in[i]
-                            
                             self.tare_buffer.append(raw_v)
                             
                             # Tare
@@ -450,6 +464,19 @@ class DAQWorker(QThread):
                             display_current = ai_data_in[i]/self.gain
                         elif func == "Extractor current" or func == "Emitter current (keysight)":
                             display_current = ai_data_in[i]
+                        elif func == "Camera FVAL":
+                            fval_voltage = ai_data_in[i]
+                            is_high = fval_voltage > 0.5
+                            
+                            if is_high and not self.last_fval_state:
+                                self.current_frame_id += 1
+                                photo_just_taken = True
+                            
+                            self.last_fval_state = is_high
+                            
+                    # Construct CSV Row: Timestamp + Inputs + Outputs
+                    row_data = [datetime.datetime.now()] + ai_data_in + ao_data_out + [self.voltage_zero_offset] + [self.gain] + [self.latest_ks_value] + [self.current_frame_id]
+                    writer.writerow(row_data)                    
 
                     # Emit signal to GUI after averaging
                     self.volts_history.append(display_volts)
@@ -463,6 +490,9 @@ class DAQWorker(QThread):
                         emit_i = display_current
                         
                     self.data_ready.emit(emit_v, emit_i)
+                    
+                    if photo_just_taken:
+                        self.photo_triggered.emit()
                     
                     # Pace the loop
                     time.sleep(self.sample_rate)
@@ -602,7 +632,7 @@ class HardwareConfigDialog(QDialog):
         self.layout_AI.addWidget(self.input_device_ai, 0, 1)
 
                     # Channel Dropdowns
-        self.AI_options = ["None", "Matsusada read in", "Current collector (FEMTO)", "Extractor current", "Keysight reading"]
+        self.AI_options = ["None", "Matsusada read in", "Current collector (FEMTO)", "Extractor current", "Keysight reading", "Camera FVAL"]
                     # Store these in a list so we can access them easily later
         self.ai_combos = []
         
@@ -845,6 +875,8 @@ class menu_camera_settings(QDialog):
 
     def start_preview(self):
         """Configure worker for FULL FRAME preview"""
+        self.worker.filepath = ""  # Prevent preview frames being written to disk
+        
         # 1. Stop if running (safety)
         if self.worker.isRunning():
             self.worker.stop()
@@ -940,7 +972,8 @@ class menu_camera_settings(QDialog):
             self.worker.image_ready.disconnect(self.update_image)
         except:
             pass
-            
+        self.worker.trigger_mode = self.config.get("trigger_mode", "Hardware")      
+    
     def closeEvent(self, event):
         self.close_cleanly()
         event.accept()
@@ -1222,6 +1255,15 @@ class ElectrosprayUI(QMainWindow):
         self.combo_mode.setEnabled(False)
         self.append_log("System Starting...")
         
+        # Recreate camera worker fresh to avoid stale SDK state from preview
+        try:
+            self.cam_worker.image_ready.disconnect(self.update_image_display)
+        except TypeError:
+            pass
+        self.cam_worker = CameraWorker()
+        self.cam_worker.log_message.connect(self.append_log)
+        self.cam_worker.image_ready.connect(self.update_image_display)
+        
         # Create timestamp linked filename
         self.filenametime = time.strftime("ESPRAY_%Y-%m-%d_%H%M")
         
@@ -1237,6 +1279,9 @@ class ElectrosprayUI(QMainWindow):
         self.trigger_points_y.clear()
         self.trigger_scatter.setData([], [])
         self.start_time = time.time()
+        self.daq_worker.current_frame_id = 0
+        self.daq_worker.last_fval_state = False
+        self.daq_worker.last_cam_trigger_time = time.time()
         
         self.legend.removeItem(self.trigger_scatter) # Remove image taken plotting by default
         
@@ -1318,7 +1363,8 @@ class ElectrosprayUI(QMainWindow):
         self.daq_worker.start()
         self.ks_worker.start()
         
-            
+        self.append_log(f"Camera timing mode: {self.cam_config['timing_mode']}") 
+        
     def closeEvent(self, event):
         """
         Runs automatically when the user clicks 'X'.
@@ -1346,6 +1392,7 @@ class ElectrosprayUI(QMainWindow):
         # Save camera config
         self.settings.setValue("cam_fps", self.cam_config["fps"])
         self.settings.setValue("cam_trigger", self.cam_config["trigger_mode"])
+        self.settings.setValue("cam_timing", self.cam_config["timing_mode"])
         self.settings.setValue("cam_roi_TL_x", self.cam_config["roi_TL_x"])
         self.settings.setValue("cam_roi_TL_y", self.cam_config["roi_TL_y"])
         self.settings.setValue("cam_roi_BR_x", self.cam_config["roi_BR_x"])
