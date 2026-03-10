@@ -327,6 +327,21 @@ class DAQWorker(QThread):
             csv_headers.append("Emitter current (Keysight)")
             csv_headers.append("Frame ID")
             
+            # Hardware clock
+            self.hardware_rate_hz = 1.0 /self.sample_rate
+            
+            self.ai_task.timing.cfg_samp_clk_timing(rate = self.hardware_rate_hz,
+                                                    sample_mode = AcquisitionType.CONTINUOUS)
+            
+            # Slow down multiplexer to allow it to saturate even at high sample rates
+            try:
+                num_chans = len(self.ai_channels_to_use)
+                if num_chans > 1:
+                    # Space out the measurements evenly to give the Matsusada time to settle
+                    self.ai_task.timing.ai_conv_rate = self.hardware_rate_hz * num_chans * 1.2
+            except Exception:
+                pass
+            
             # Create file with the dynamic headers
             with open(self.filepath, mode='w', newline='') as f:
                 csv.writer(f).writerow(csv_headers)
@@ -355,6 +370,9 @@ class DAQWorker(QThread):
             with open(self.filepath, mode='a', newline='') as f:
                 writer = csv.writer(f)
                 
+                if self.ai_channels_to_use:
+                    self.ai_task.start()
+                
                 while self.is_running:
                     now = time.time()
                     
@@ -374,6 +392,7 @@ class DAQWorker(QThread):
                         self.mid_cycle_flag = True
                         
                     ao_data_out = []
+                    
                     
                     for func in self.ao_ordered_functions:
                         val_to_write = 0.0
@@ -421,73 +440,98 @@ class DAQWorker(QThread):
 
                     # WRITE AO (if channels exist)
                     if ao_data_out:
-                        self.ao_task.write(ao_data_out)
+                        # Only push to the DAQ if there's actually an update
+                        if getattr(self, "last_ao_written", None) != ao_data_out:
+                            self.ao_task.write(ao_data_out, auto_start=True)
+                            self.last_ao_written = ao_data_out.copy()
 
+                   # --------------------------------------
+                    # 2. READ INPUTS 
                     # --------------------------------------
-                    # 2. READ INPUTS
-                    # --------------------------------------
-                    
-                    # Read all AI channels at once
-                    # Returns a list of floats, e.g. [0.004, 2.5]
                     if self.ai_channels_to_use:
-                        ai_data_in = self.ai_task.read()
-                        
-                        # Handle single channel case (nidaq returns float, not list)
-                        if not isinstance(ai_data_in, list):
-                            ai_data_in = [ai_data_in]
+                        try:
+                            # Get all data points the DAQ recorded since the last loop
+                            raw_ai_chunk = self.ai_task.read(number_of_samples_per_channel=READ_ALL_AVAILABLE)
+                        except Exception as e:
+                            self.log_message.emit(f"Buffer read error: {e}")
+                            time.sleep(0.01)
+                            continue
+                            
+                        # Format check to ensure it's a 2D list even if using 1 channel
+                        if not raw_ai_chunk:
+                            num_samples = 0
+                        elif not isinstance(raw_ai_chunk[0], list):
+                            raw_ai_chunk = [raw_ai_chunk]
+                            num_samples = len(raw_ai_chunk[0])
+                        else:
+                            num_samples = len(raw_ai_chunk[0])
                     else:
-                        ai_data_in = []
+                        num_samples = 0
+
+                    if num_samples == 0:
+                        # If the buffer is empty, wait and skip to the next loop
+                        time.sleep(0.005)
+                        continue
 
                     # --------------------------------------
-                    # 3. LOGGING & UPDATE
+                    # 3. PROCESS CHUNK & LOGGING
                     # --------------------------------------
-                    
-                    # Update GUI Display
-                    # We need to find the "Meaningful" values to send to the UI
-                    # (e.g. Find which channel is Voltage and which is Current)
-                    display_volts = 0.0
-                    display_current = 0.0
+                    rows_to_write = []
                     photo_just_taken = False
                     
-                    for i, func in enumerate(self.ai_ordered_functions):
-                        if func == "Matsusada read in":
-                            raw_v = ai_data_in[i]
-                            self.tare_buffer.append(raw_v)
-                            
-                            # Tare
-                            if self.request_tare:
-                                if len(self.tare_buffer) > 0:
-                                    self.voltage_zero_offset = sum(self.tare_buffer) / len(self.tare_buffer)
-                                else:
-                                    self.voltage_zero_offset = raw_v # Failsafe
-                                    
-                                self.request_tare = False
-                                
-                                if self.target_voltage != 0:
-                                    self.log_message.emit(f"WARNING: Taring at non-zero voltage output ({self.target_voltage}). This will not correct for a zero-error.")
-                            
-                            # Calculate the active display voltage using the locked offset
-                            display_volts = (raw_v - self.voltage_zero_offset) * 500.0
-                            
-                        elif func == "Current collector (FEMTO)":
-                            display_current = ai_data_in[i]/self.gain
-                        elif func == "Extractor current" or func == "Emitter current (keysight)":
-                            display_current = ai_data_in[i]
-                        elif func == "Camera FVAL":
-                            fval_voltage = ai_data_in[i]
-                            is_high = fval_voltage > 0.5
-                            
-                            if is_high and not self.last_fval_state:
-                                self.current_frame_id += 1
-                                photo_just_taken = True
-                            
-                            self.last_fval_state = is_high
-                            
-                    # Construct CSV Row: Timestamp + Inputs + Outputs
-                    row_data = [datetime.datetime.now()] + ai_data_in + ao_data_out + [self.voltage_zero_offset] + [self.gain] + [self.latest_ks_value] + [self.current_frame_id]
-                    writer.writerow(row_data)                    
+                    # Calculate perfect microsecond timestamps for this chunk
+                    chunk_end_time = datetime.datetime.now()
+                    time_step = datetime.timedelta(seconds=(1.0 / self.hardware_rate_hz))
+                    chunk_start_time = chunk_end_time - (num_samples * time_step)
+                    
+                    # Variables to hold the final value of the chunk for the GUI
+                    display_volts = 0.0
+                    display_current = 0.0
 
-                    # Emit signal to GUI after averaging
+                    # Process every single reading the DAQ took while Python was busy
+                    for sample_idx in range(num_samples):
+                        # Extract the row for this specific point in time
+                        ai_data_in = [chan[sample_idx] for chan in raw_ai_chunk]
+                        sample_timestamp = chunk_start_time + (sample_idx * time_step)
+                        
+                        for i, func in enumerate(self.ai_ordered_functions):
+                            if func == "Matsusada read in":
+                                raw_v = ai_data_in[i]
+                                self.tare_buffer.append(raw_v)
+                                
+                                if self.request_tare:
+                                    if len(self.tare_buffer) > 0:
+                                        self.voltage_zero_offset = sum(self.tare_buffer) / len(self.tare_buffer)
+                                    else:
+                                        self.voltage_zero_offset = raw_v
+                                    self.request_tare = False
+                                    
+                                display_volts = (raw_v - self.voltage_zero_offset) * 500.0
+                                
+                            elif func == "Current collector (FEMTO)":
+                                display_current = ai_data_in[i]/self.gain
+                            elif func == "Extractor current" or "Keysight" in func:
+                                display_current = ai_data_in[i]
+                                
+                            # FVAL Receipt Logic
+                            elif "Camera FVAL" in func or "Camera strobe" in func:
+                                fval_voltage = ai_data_in[i]
+                                is_high = fval_voltage > 0.5
+                                
+                                if is_high and not self.last_fval_state:
+                                    self.current_frame_id += 1
+                                    photo_just_taken = True
+                                
+                                self.last_fval_state = is_high
+
+                        # Build the CSV row and add it to our chunk
+                        row_data = [sample_timestamp] + ai_data_in + ao_data_out + [self.voltage_zero_offset] + [self.gain] + [self.latest_ks_value] + [self.current_frame_id]
+                        rows_to_write.append(row_data)
+
+                    # Write the entire high-speed chunk to the file at once
+                    writer.writerows(rows_to_write) 
+
+                    # Update the GUI with just the latest values from the chunk to save CPU
                     self.volts_history.append(display_volts)
                     self.amps_history.append(display_current)
                     
@@ -500,7 +544,10 @@ class DAQWorker(QThread):
                         
                     self.data_ready.emit(emit_v, emit_i)
                     
-                    # Pace the loop
+                    if photo_just_taken:
+                        self.photo_triggered.emit()
+                    
+                    # Pace the Python software loop
                     time.sleep(self.sample_rate)
 
         except Exception as e:
