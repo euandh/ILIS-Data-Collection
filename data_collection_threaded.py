@@ -35,6 +35,7 @@ import time
 import sys
 import csv
 import datetime
+import json
 
 # GUI Libaries
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -70,6 +71,7 @@ import serial.tools.list_ports
 class CameraWorker(QThread):
     image_ready = pyqtSignal(object)  # Sends numpy array
     log_message = pyqtSignal(str)
+    camera_metadata = pyqtSignal(dict) # for logging camera settings to metadata
     
     def __init__(self):
         super().__init__()
@@ -123,23 +125,27 @@ class CameraWorker(QThread):
                 self.camera.operation_mode = OPERATION_MODE.HARDWARE_TRIGGERED
                 self.camera.frames_per_trigger_zero_for_unlimited = 1
                 self.camera.trigger_polarity = TRIGGER_POLARITY.ACTIVE_HIGH
-                print("In hardware mode")
             else:
                 self.camera.operation_mode = 0
                 self.camera.frames_per_trigger_zero_for_unlimited = 0
                 self.camera.trigger_polarity = TRIGGER_POLARITY.ACTIVE_HIGH
-                print("Not in hardware mode")
             
             self.camera.arm(2) # 2 frames buffer
-
-            # Enable EEP to get a signal during actual exposure, not readout
-            if self.camera.is_eep_supported:
-                self.camera.is_eep_enabled = True
-                self.log_message.emit("EEP mode enabled - signal active during exposure")
-            else:
-                self.log_message.emit("WARNING: EEP not supported on this camera, falling back to FVAL")
-            
+                        
             self.log_message.emit(f"Camera arming in {self.trigger_mode} mode, frames_per_trigger={self.camera.frames_per_trigger_zero_for_unlimited}")
+            
+            # Metadata handling
+            frame_time = self.camera.frame_time_us
+            exposure_time = self.camera.exposure_time_us
+            readout_time = self.camera.sensor_readout_time_ns
+            
+            self.camera_metadata.emit({
+                "exposure_time_us": exposure_time,
+                "frame_time_us": frame_time,
+                "readout_time_us": frame_time - exposure_time,
+                "sensor_readout_time_ns" : readout_time,
+                })
+
 
             # 3. Continuous Loop
             # Trigger first frame if in Software mode
@@ -395,12 +401,15 @@ class DAQWorker(QThread):
                                     if (now - self.last_cam_trigger_time) >= self.cam_trigger_period:
                                         val_to_write = 5.0
                                         self.last_cam_trigger_time = now
+                                        self.photo_triggered.emit()
+                                        
                                 elif self.cam_timing_mode == "Mid-cycle":
                                     time_in_state = now - last_switch_time
                                     
                                     if time_in_state >= self.cam_half_way and not self.mid_cycle_flag:
                                         self.mid_cycle_flag = True
                                         self.cam_pulse_counter = 3  # Hold high for 3 loop iterations (~480ms)
+                                        self.photo_triggered.emit()
                                     
                                     if self.cam_pulse_counter > 0:
                                         val_to_write = 5.0
@@ -490,9 +499,6 @@ class DAQWorker(QThread):
                         emit_i = display_current
                         
                     self.data_ready.emit(emit_v, emit_i)
-                    
-                    if photo_just_taken:
-                        self.photo_triggered.emit()
                     
                     # Pace the loop
                     time.sleep(self.sample_rate)
@@ -1199,6 +1205,7 @@ class ElectrosprayUI(QMainWindow):
         # Connect Signals (Worker -> GUI)
         self.cam_worker.log_message.connect(self.append_log)
         self.cam_worker.image_ready.connect(self.update_image_display) # You need to write this function
+        self.cam_worker.camera_metadata.connect(self.append_camera_metadata)
         self.daq_worker.data_ready.connect(self.update_daq_display)
         self.daq_worker.log_message.connect(self.append_log)
         self.daq_worker.photo_triggered.connect(self.mark_photo_on_graph)
@@ -1263,6 +1270,7 @@ class ElectrosprayUI(QMainWindow):
         self.cam_worker = CameraWorker()
         self.cam_worker.log_message.connect(self.append_log)
         self.cam_worker.image_ready.connect(self.update_image_display)
+        self.cam_worker.camera_metadata.connect(self.append_camera_metadata)
         
         # Create timestamp linked filename
         self.filenametime = time.strftime("ESPRAY_%Y-%m-%d_%H%M")
@@ -1294,9 +1302,10 @@ class ElectrosprayUI(QMainWindow):
         else:
             use_cam = False
             self.append_log("Mode: DAQ Only (Camera OFF)") 
-            
+            self.write_metadata()
             
         self.daq_worker.use_camera = use_cam
+
     
         # Pass settings to workers
             # Cam worker
@@ -1462,6 +1471,24 @@ class ElectrosprayUI(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.combo_mode.setEnabled(True)
 
+    def write_metadata(self, cam_meta=None):
+        metadata = {
+            "timestamp": self.filenametime,
+            "sample_rate_ms": self.input_sample_rate.value(),
+            "ai_channel_map": self.hw_config["ai_map"],
+            "ao_channel_map": self.hw_config["ao_map"],
+        }
+        
+        if cam_meta is not None:
+            metadata["camera"] = cam_meta
+        
+        filepath = f"{self.input_filepath.text()}/{self.filenametime}_METADATA.json"
+
+        with open(filepath, 'w') as f:
+            json.dump(metadata, f, indent=4)
+            
+        self.append_log(f"Metadata saved to {filepath}")
+
     @pyqtSlot(str)
     def append_log(self, text):
         self.log_box.append(text)
@@ -1533,6 +1560,11 @@ class ElectrosprayUI(QMainWindow):
     @pyqtSlot()
     def update_DAQ_smoothing(self):
         self.daq_worker.smooth_display = self.input_check_smooth.isChecked()
+
+    @pyqtSlot(dict)
+    def append_camera_metadata(self, cam_meta):
+        self.write_metadata(cam_meta=cam_meta)
+        self.append_log(f"Camera metadata appended: readout offset = {cam_meta['readout_time_us']} us")
 
 # --- APP ENTRY POINT ---
 if __name__ == "__main__":
