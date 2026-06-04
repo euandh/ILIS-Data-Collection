@@ -1527,7 +1527,6 @@ class ElectrosprayUI(QMainWindow):
 
     def write_metadata(self, cam_meta=None):
         metadata = {
-            "timestamp": self.filenametime,
             "sample_rate_ms": self.input_sample_rate.value(),
             "ai_channel_map": self.hw_config["ai_map"],
             "ao_channel_map": self.hw_config["ao_map"],
