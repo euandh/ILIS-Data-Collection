@@ -36,7 +36,6 @@ import sys
 import csv
 import datetime
 import json
-import cv2
 
 # GUI Libaries
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -659,61 +658,6 @@ class KeysightWorker(QThread):
         self.is_running = False
         self.wait()
 
-# --- WORKER THREAD: MULTIMETER WEBCAM ---
-class WebcamWorker(QThread):
-    log_message = pyqtSignal(str)
-
-    def __init__(self, camera_index=0):
-        super().__init__()
-        self.is_running = False
-        self.camera_index = camera_index  # 0 is usually the default built-in/USB webcam
-        self.filepath_prefix = ""
-        self.latest_frame = None
-        self.capture_requested = False
-        self.current_save_id = 0
-
-    def run(self):
-        self.is_running = True
-        cap = cv2.VideoCapture(self.camera_index)
-
-        # Force a low resolution so saving the JPEG takes almost zero CPU time
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-        if not cap.isOpened():
-            self.log_message.emit("Webcam Error: Could not connect to USB camera.")
-            return
-            
-        self.log_message.emit("Webcam connected. Watching multimeter...")
-
-        while self.is_running:
-            # Constantly pull the latest frame into RAM so it's ready instantly
-            ret, frame = cap.read()
-            if ret:
-                self.latest_frame = frame
-
-            # If the DAQ triggered a save request, dump it to the hard drive
-            if self.capture_requested and self.latest_frame is not None:
-                # E.g., ESPRAY_2026-03-10_1624_MM_00001.jpg
-                filename = f"{self.filepath_prefix}_{self.current_save_id:05d}.jpg"
-                cv2.imwrite(filename, self.latest_frame)
-                self.capture_requested = False
-
-            # Sleep tiny amount to prevent this thread from hogging the CPU
-            time.sleep(0.01) 
-
-        cap.release()
-
-    @pyqtSlot(int)
-    def save_current_frame(self, frame_id):
-        # The GUI calls this instantly when FVAL is detected
-        self.current_save_id = frame_id
-        self.capture_requested = True
-
-    def stop(self):
-        self.is_running = False
-        self.wait()
-
 # --- HARDWARE CONFIGURATION DIALOGUE ---
 class HardwareConfigDialog(QDialog):
     """
@@ -1083,10 +1027,6 @@ class menu_camera_settings(QDialog):
             self.worker.stop()
             self.worker.wait()
             
-        if hasattr(self, 'webcam_worker') and self.webcam_worker.isRunning(): # <--- ADD THIS BLOCK
-            self.webcam_worker.stop()
-            self.webcam_worker.wait()
-            
         # 2. Disconnect signal
         try:
             self.worker.image_ready.disconnect(self.update_image)
@@ -1315,7 +1255,6 @@ class ElectrosprayUI(QMainWindow):
         self.cam_worker = CameraWorker()
         self.daq_worker = DAQWorker()
         self.ks_worker = KeysightWorker()
-        self.webcam_worker = WebcamWorker(camera_index=0)
 
         # Connect Signals (Worker -> GUI)
         self.cam_worker.log_message.connect(self.append_log)
@@ -1326,7 +1265,6 @@ class ElectrosprayUI(QMainWindow):
         self.daq_worker.photo_triggered.connect(self.mark_photo_on_graph)
         self.ks_worker.log_message.connect(self.append_log)
         self.ks_worker.ks_reading.connect(self.daq_worker.update_ks_value)
-        self.webcam_worker.log_message.connect(self.append_log)
 
 
         # Recall previous settings values
@@ -1424,16 +1362,15 @@ class ElectrosprayUI(QMainWindow):
 
     
         # Pass settings to workers
-            # Cam worker and Multimeter worker
+            # Cam worker
         if use_cam == True:
             self.cam_worker.filepath = f"{self.input_filepath.text()}/{self.filenametime}_IMAGES.tiff"
-            self.webcam_worker.filepath_prefix = f"{self.input_filepath.text()}/{self.filenametime}_MM"
             
             self.cam_worker.ROI = [self.cam_config["roi_TL_x"],
                                    self.cam_config["roi_TL_y"],
                                    self.cam_config["roi_BR_x"],
                                    self.cam_config["roi_BR_y"]]
-
+            self.cam_worker.trigger_mode = self.cam_config["trigger_mode"]
             
             # Daq worker
         self.daq_worker.filepath = f"{self.input_filepath.text()}/{self.filenametime}_DATA.csv"
@@ -1486,7 +1423,6 @@ class ElectrosprayUI(QMainWindow):
         # Start Threads
         if use_cam == True:
             self.cam_worker.start()
-            self.webcam_worker.start()
         self.daq_worker.start()
         self.ks_worker.start()
         
@@ -1580,7 +1516,6 @@ class ElectrosprayUI(QMainWindow):
         self.cam_worker.stop()
         self.daq_worker.stop()
         self.ks_worker.stop()
-        self.webcam_worker.stop()
         
         # unlock inputs
         self.input_sample_rate.setEnabled(True)
@@ -1616,15 +1551,13 @@ class ElectrosprayUI(QMainWindow):
         # Transpose to fix rotation (Cameras scan differently than screens)
         display_data = image_array.T
 
-        try:
-            # Use safe getattr check in case the image attribute isn't built yet
-            if getattr(self.cam_view, 'image', None) is None:
-                self.cam_view.setImage(display_data, autoLevels=True, autoRange=True)
-            else:
-                # Keep autoLevels=True so the feed doesn't black out if the lighting changes!
-                self.cam_view.setImage(display_data, autoLevels=True, autoRange=False)
-        except Exception as e:
-            self.append_log(f"Display Error: {e}")
+        # AUTO-RANGE LOGIC
+        # If the view is empty (first frame), Force Zoom-to-Fit
+        if self.cam_view.image is None:
+            self.cam_view.setImage(display_data, autoLevels=True, autoRange=True)
+        else:
+            # Afterwards, keep user's zoom/pan
+            self.cam_view.setImage(display_data, autoLevels=False, autoRange=False)
             
     @pyqtSlot(float, float)
     def update_daq_display(self, volts, amps):
@@ -1663,9 +1596,6 @@ class ElectrosprayUI(QMainWindow):
             self.trigger_points_x.append(current_t)
             self.trigger_points_y.append(current_v)
             self.trigger_scatter.setData(list(self.trigger_points_x), list(self.trigger_points_y))
-            
-            if hasattr(self, 'webcam_worker') and self.webcam_worker.isRunning():
-                self.webcam_worker.save_current_frame(self.daq_worker.current_frame_id)
 
     @pyqtSlot()
     def tare_voltage(self):
@@ -1686,10 +1616,6 @@ class ElectrosprayUI(QMainWindow):
 
     @pyqtSlot(dict)
     def append_camera_metadata(self, cam_meta):
-        # Prevent crashing if the settings preview broadcasts metadata before we hit Start
-        if not hasattr(self, 'filenametime'):
-            return
-        
         self.write_metadata(cam_meta=cam_meta)
         self.append_log(f"Camera metadata appended: readout offset = {cam_meta['readout_time_us']} us")
 
